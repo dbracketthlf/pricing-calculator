@@ -1,4 +1,5 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
+import html2pdf from 'html2pdf.js';
 
 /**
  * COMPLETE MULTI-PRODUCT PRICING CALCULATOR
@@ -60,7 +61,7 @@ const PricingCalculatorApp = () => {
 
   return (
     <div style={styles.appContainer}>
-      <div style={styles.mainNav}>
+      <div style={styles.mainNav} className="no-print">
         <button
           onClick={() => setActiveTab('prequal')}
           style={{ ...styles.mainNavButton, ...(activeTab === 'prequal' ? styles.mainNavButtonActive : {}) }}
@@ -313,17 +314,38 @@ const CalculatorTab = ({ prefill, onPrefillConsumed }) => {
       const paymentType = product.paymentType || (isMortgage ? 'amortized' : 'interestOnly');
       const term = parseFloat(formData.loanTerm);
 
+      const fees = {
+        underwriting: 1295,
+        processing: 895,
+        creditReport: 200,
+        appraisal: 700,
+        total: 3090
+      };
+      const isCashout = isMortgage && formData.loanPurpose === 'cashout';
+      const currentBalanceNum = isCashout ? parseFloat(formData.currentBalance) : null;
+
       // Three pricing options, priced off the retail rate via points
       const quoteOptions = [
         { id: 'buydown', label: 'Buy Down', points: 2, rate: retailRate - 0.50 },
         { id: 'balanced', label: 'Balanced', points: 1, rate: retailRate - 0.25 },
         { id: 'nocost', label: 'No Cost', points: 0, rate: retailRate + 0.50 }
-      ].map(option => ({
-        ...option,
-        rate: option.rate.toFixed(2),
-        monthlyPayment: calculatePayment(loanAmount, option.rate, term, paymentType).toFixed(2),
-        pointsCost: (loanAmount * option.points / 100).toFixed(2)
-      }));
+      ].map(option => {
+        const pointsCost = loanAmount * option.points / 100;
+        const result = {
+          ...option,
+          rate: option.rate.toFixed(2),
+          monthlyPayment: calculatePayment(loanAmount, option.rate, term, paymentType).toFixed(2),
+          pointsCost: pointsCost.toFixed(2)
+        };
+        if (isCashout) {
+          // Total closing costs for THIS option = flat lender fees + this
+          // option's points cost, since points are money the borrower pays
+          // (or nets out of proceeds) at closing just like any other fee.
+          const cashOut = loanAmount - currentBalanceNum - (fees.total + pointsCost);
+          result.cashOutAmount = cashOut.toFixed(2);
+        }
+        return result;
+      });
 
       // Generate term sheet
       setTermSheet({
@@ -338,13 +360,8 @@ const CalculatorTab = ({ prefill, onPrefillConsumed }) => {
         loanTerm: formData.loanTerm,
         loanPurpose: isMortgage ? formData.loanPurpose : 'N/A',
         occupancy: formData.occupancyType,
-        fees: {
-          underwriting: 1295,
-          processing: 895,
-          creditReport: 200,
-          appraisal: 700,
-          total: 3090
-        },
+        currentBalance: isCashout ? currentBalanceNum.toFixed(0) : null,
+        fees,
         paymentType,
         prepaymentPenaltyYears: (selectedProduct === 'nonQm' && formData.occupancyType === 'investment')
           ? formData.prepaymentPenaltyYears
@@ -921,9 +938,26 @@ const PreQualTab = ({ formData, setFormData, results, setResults, onGetDetailedQ
  * TERM SHEET DISPLAY
  */
 const TermSheetDisplay = ({ termSheet, onBack }) => {
+  const printableRef = useRef(null);
+  const [selectedOptionId, setSelectedOptionId] = useState('balanced');
+  const selectedOption = termSheet.quoteOptions.find(o => o.id === selectedOptionId) || termSheet.quoteOptions[1];
+  const isCashout = termSheet.loanPurpose === 'cashout';
+
   const downloadPDF = () => {
-    // Simplified PDF - in production, use jsPDF or similar
-    alert('PDF download feature - would integrate jsPDF library');
+    const namePart = (termSheet.borrowerName || 'Borrower').trim().replace(/\s+/g, '-');
+    const datePart = new Date().toISOString().slice(0, 10);
+    html2pdf().set({
+      margin: 0.4,
+      filename: `Loan-Estimate-${namePart}-${datePart}.pdf`,
+      image: { type: 'jpeg', quality: 0.98 },
+      html2canvas: { scale: 2, useCORS: true },
+      jsPDF: { unit: 'in', format: 'letter', orientation: 'portrait' },
+      pagebreak: { mode: ['avoid-all', 'css', 'legacy'] }
+    }).from(printableRef.current).save();
+  };
+
+  const printQuote = () => {
+    window.print();
   };
 
   const shareViaEmail = () => {
@@ -940,135 +974,241 @@ const TermSheetDisplay = ({ termSheet, onBack }) => {
     heloan: 'HELoan'
   };
 
+  const purposeLabels = {
+    purchase: 'Purchase',
+    refi: 'Refinance (Rate & Term)',
+    cashout: 'Cash-Out Refinance'
+  };
+
+  const money = (v, opts = {}) => `$${parseFloat(v).toLocaleString('en-US', { maximumFractionDigits: 0, ...opts })}`;
+
   return (
     <div style={styles.termSheetContainer}>
-      <div style={styles.termSheetHeader}>
-        <h1 style={styles.termSheetTitle}>{loanTypeNames[termSheet.product]} ESTIMATE</h1>
-        <p style={styles.termSheetSubtitle}>ESTIMATE ONLY - NOT AN OFFER</p>
-      </div>
+      <style>{`
+        @media print {
+          .no-print { display: none !important; }
+          html, body { background: #fff !important; }
+          #root, .term-sheet-printable, .term-sheet-printable * {
+            color: #000 !important;
+            background: #fff !important;
+            box-shadow: none !important;
+          }
+          .term-sheet-printable { border: none !important; }
+        }
+        @page { size: letter; margin: 0.5in; }
+      `}</style>
 
-      <div style={styles.warningBanner}>
-        <span>ⓘ</span>
-        <div>
-          <strong>AUTOMATED ESTIMATE - NOT A COMMITMENT</strong>
-          <p style={styles.warningText}>
-            This estimate is automatically generated based solely on information you provided 
-            and has NOT been reviewed by a loan officer. To receive a firm offer, complete a full application.
-          </p>
+      <div ref={printableRef} className="term-sheet-printable">
+        <div style={styles.letterheadHeader}>
+          {termSheet.lenderName && <div style={styles.letterheadLender}>{termSheet.lenderName}</div>}
+          <h1 style={styles.termSheetTitle}>{loanTypeNames[termSheet.product]} ESTIMATE</h1>
+          <p style={styles.termSheetSubtitle}>ESTIMATE ONLY - NOT AN OFFER</p>
         </div>
-      </div>
 
-      {/* Borrower & Loan Info */}
-      <div style={styles.section}>
-        <h2 style={styles.sectionTitle}>Loan Details</h2>
-        <div style={styles.infoGrid}>
-          <div style={styles.infoItem}>
-            <span style={styles.infoLabel}>Name:</span>
-            <span style={styles.infoValue}>{termSheet.borrowerName || 'Not provided'}</span>
+        <div style={styles.warningBanner}>
+          <span>ⓘ</span>
+          <div>
+            <strong>AUTOMATED ESTIMATE - NOT A COMMITMENT</strong>
+            <p style={styles.warningText}>
+              This estimate is automatically generated based solely on information you provided
+              and has NOT been reviewed by a loan officer. To receive a firm offer, complete a full application.
+            </p>
           </div>
-          <div style={styles.infoItem}>
-            <span style={styles.infoLabel}>Property:</span>
-            <span style={styles.infoValue}>{termSheet.propertyAddress || 'Not provided'}</span>
-          </div>
-          {termSheet.lenderName && (
+        </div>
+
+        {/* Borrower & Loan Info */}
+        <div style={styles.section}>
+          <h2 style={styles.sectionTitle}>Loan Details</h2>
+          <div style={styles.infoGrid}>
             <div style={styles.infoItem}>
-              <span style={styles.infoLabel}>Lender:</span>
-              <span style={styles.infoValue}>{termSheet.lenderName}</span>
+              <span style={styles.infoLabel}>Name:</span>
+              <span style={styles.infoValue}>{termSheet.borrowerName || 'Not provided'}</span>
+            </div>
+            <div style={styles.infoItem}>
+              <span style={styles.infoLabel}>Property:</span>
+              <span style={styles.infoValue}>{termSheet.propertyAddress || 'Not provided'}</span>
+            </div>
+            {termSheet.lenderName && (
+              <div style={styles.infoItem}>
+                <span style={styles.infoLabel}>Lender:</span>
+                <span style={styles.infoValue}>{termSheet.lenderName}</span>
+              </div>
+            )}
+            <div style={styles.infoItem}>
+              <span style={styles.infoLabel}>Loan Type / Purpose:</span>
+              <span style={styles.infoValue}>
+                {loanTypeNames[termSheet.product]}
+                {purposeLabels[termSheet.loanPurpose] ? ` — ${purposeLabels[termSheet.loanPurpose]}` : ''}
+              </span>
+            </div>
+            <div style={styles.infoItem}>
+              <span style={styles.infoLabel}>Loan Amount:</span>
+              <span style={styles.infoValue}>{money(termSheet.loanAmount)}</span>
+            </div>
+            <div style={styles.infoItem}>
+              <span style={styles.infoLabel}>LTV:</span>
+              <span style={styles.infoValue}>{termSheet.ltv}%</span>
+            </div>
+            {termSheet.prepaymentPenaltyYears && (
+              <div style={styles.infoItem}>
+                <span style={styles.infoLabel}>Prepayment Penalty:</span>
+                <span style={styles.infoValue}>{termSheet.prepaymentPenaltyYears}-Year</span>
+              </div>
+            )}
+          </div>
+        </div>
+
+        {/* Prominent selected-quote summary */}
+        <div style={styles.selectedQuoteBox}>
+          <div style={styles.selectedQuoteLabel}>Your Selected Quote — {selectedOption.label}</div>
+          <div style={styles.selectedQuotePayment}>
+            {money(selectedOption.monthlyPayment, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+            <span style={{ fontSize: '18px', color: '#555', fontWeight: 'normal' }}> /mo</span>
+          </div>
+          <div style={styles.selectedQuoteMeta}>
+            {selectedOption.rate}% Rate · {selectedOption.points} Point{selectedOption.points === 1 ? '' : 's'}
+            {termSheet.paymentType === 'interestOnly' ? ' · Interest-Only' : ` · ${termSheet.loanTerm}-Year ${termSheet.paymentType}`}
+          </div>
+          {isCashout && (
+            <div style={{ ...styles.selectedQuoteMeta, color: '#1E6F49', fontWeight: 'bold', fontSize: '16px' }}>
+              Estimated Cash-Out: {money(selectedOption.cashOutAmount)}
             </div>
           )}
-          <div style={styles.infoItem}>
-            <span style={styles.infoLabel}>Loan Amount:</span>
-            <span style={styles.infoValue}>${parseFloat(termSheet.loanAmount).toLocaleString('en-US', {maximumFractionDigits: 0})}</span>
+        </div>
+
+        {/* Pricing */}
+        <div style={styles.section}>
+          <h2 style={styles.sectionTitle}>Choose Your Rate Option</h2>
+          <div style={styles.quoteOptionsGrid}>
+            {termSheet.quoteOptions.map(option => (
+              <button
+                key={option.id}
+                type="button"
+                onClick={() => setSelectedOptionId(option.id)}
+                style={{
+                  ...styles.quoteOptionCard,
+                  ...(option.id === selectedOptionId ? styles.quoteOptionCardSelected : {})
+                }}
+              >
+                <div style={styles.quoteOptionLabel}>
+                  {option.label}{option.id === selectedOptionId ? ' ✓ Selected' : ''}
+                </div>
+                <div style={styles.quoteOptionRate}>{option.rate}%</div>
+                <div style={styles.quoteOptionRow}>
+                  <span>Points:</span>
+                  <span>{option.points} ({money(option.pointsCost)})</span>
+                </div>
+                <div style={styles.quoteOptionRow}>
+                  <span>Monthly Payment:</span>
+                  <span>{money(option.monthlyPayment, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
+                </div>
+                {isCashout && (
+                  <div style={styles.quoteOptionCashOut}>
+                    <span>Est. Cash-Out:</span>
+                    <span>{money(option.cashOutAmount)}</span>
+                  </div>
+                )}
+                <div style={styles.pricingNote}>
+                  {termSheet.paymentType === 'interestOnly' ? '(Interest-Only)' : `(${termSheet.loanTerm}-year ${termSheet.paymentType})`}
+                </div>
+              </button>
+            ))}
           </div>
-          <div style={styles.infoItem}>
-            <span style={styles.infoLabel}>LTV:</span>
-            <span style={styles.infoValue}>{termSheet.ltv}%</span>
-          </div>
-          {termSheet.prepaymentPenaltyYears && (
-            <div style={styles.infoItem}>
-              <span style={styles.infoLabel}>Prepayment Penalty:</span>
-              <span style={styles.infoValue}>{termSheet.prepaymentPenaltyYears}-Year</span>
+        </div>
+
+        {/* Cash-Out Details */}
+        {isCashout && (
+          <div style={styles.section}>
+            <h2 style={styles.sectionTitle}>Cash-Out Calculation</h2>
+            <div style={styles.infoGrid}>
+              <div style={styles.infoItem}>
+                <span style={styles.infoLabel}>Current Loan Balance:</span>
+                <span style={styles.infoValue}>{money(termSheet.currentBalance)}</span>
+              </div>
+              <div style={styles.infoItem}>
+                <span style={styles.infoLabel}>New Loan Amount:</span>
+                <span style={styles.infoValue}>{money(termSheet.loanAmount)}</span>
+              </div>
+              <div style={styles.infoItem}>
+                <span style={styles.infoLabel}>Est. Cash-Out ({selectedOption.label}):</span>
+                <span style={styles.infoValue}>{money(selectedOption.cashOutAmount)}</span>
+              </div>
             </div>
-          )}
-        </div>
-      </div>
+            <p style={styles.feeNote}>
+              Formula: New Loan Amount − Current Loan Balance − Closing Costs (lender fees + points for the selected option) = Estimated Cash-Out.
+            </p>
+            <div style={styles.cashOutDisclaimerBox}>
+{`IMPORTANT: Cash-out estimate does NOT include:
+ • Title insurance
+ • Escrow fees
+ • Recording fees
+ • Other third-party costs
 
-      {/* Pricing */}
-      <div style={styles.section}>
-        <h2 style={styles.sectionTitle}>Choose Your Rate Option</h2>
-        <div style={styles.quoteOptionsGrid}>
-          {termSheet.quoteOptions.map(option => (
-            <div key={option.id} style={styles.quoteOptionCard}>
-              <div style={styles.quoteOptionLabel}>{option.label}</div>
-              <div style={styles.quoteOptionRate}>{option.rate}%</div>
-              <div style={styles.quoteOptionRow}>
-                <span>Points:</span>
-                <span>{option.points} ({`$${parseFloat(option.pointsCost).toLocaleString('en-US', {maximumFractionDigits: 0})}`})</span>
-              </div>
-              <div style={styles.quoteOptionRow}>
-                <span>Monthly Payment:</span>
-                <span>${parseFloat(option.monthlyPayment).toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2})}</span>
-              </div>
-              <div style={styles.pricingNote}>
-                {termSheet.paymentType === 'interestOnly' ? '(Interest-Only)' : `(${termSheet.loanTerm}-year ${termSheet.paymentType})`}
-              </div>
+Final cash-out may be lower after all costs are calculated.`}
             </div>
-          ))}
-        </div>
-      </div>
+          </div>
+        )}
 
-      {/* Fees */}
-      <div style={styles.section}>
-        <h2 style={styles.sectionTitle}>Estimated Closing Costs</h2>
-        <div style={styles.feesBox}>
-          <div style={styles.feeRow}>
-            <span>Underwriting Fee:</span>
-            <span>${termSheet.fees.underwriting.toLocaleString()}</span>
+        {/* Fees */}
+        <div style={styles.section}>
+          <h2 style={styles.sectionTitle}>Estimated Closing Costs</h2>
+          <div style={styles.feesBox}>
+            <div style={styles.feeRow}>
+              <span>Underwriting Fee:</span>
+              <span>${termSheet.fees.underwriting.toLocaleString()}</span>
+            </div>
+            <div style={styles.feeRow}>
+              <span>Processing Fee:</span>
+              <span>${termSheet.fees.processing.toLocaleString()}</span>
+            </div>
+            <div style={styles.feeRow}>
+              <span>Credit Report:</span>
+              <span>${termSheet.fees.creditReport.toLocaleString()}</span>
+            </div>
+            <div style={styles.feeRow}>
+              <span>Appraisal:</span>
+              <span>${termSheet.fees.appraisal.toLocaleString()}</span>
+            </div>
+            <div style={{ ...styles.feeRow, ...styles.feeTotal }}>
+              <span>TOTAL LENDER FEES:</span>
+              <span>${termSheet.fees.total.toLocaleString()}</span>
+            </div>
           </div>
-          <div style={styles.feeRow}>
-            <span>Processing Fee:</span>
-            <span>${termSheet.fees.processing.toLocaleString()}</span>
-          </div>
-          <div style={styles.feeRow}>
-            <span>Credit Report:</span>
-            <span>${termSheet.fees.creditReport.toLocaleString()}</span>
-          </div>
-          <div style={styles.feeRow}>
-            <span>Appraisal:</span>
-            <span>${termSheet.fees.appraisal.toLocaleString()}</span>
-          </div>
-          <div style={{ ...styles.feeRow, ...styles.feeTotal }}>
-            <span>TOTAL LENDER FEES:</span>
-            <span>${termSheet.fees.total.toLocaleString()}</span>
-          </div>
+          <p style={styles.feeNote}>
+            ⓘ Title, escrow, and recording fees are NOT included and will be calculated at closing.
+          </p>
         </div>
-        <p style={styles.feeNote}>
-          ⓘ Title, escrow, and recording fees are NOT included and will be calculated at closing.
-        </p>
-      </div>
 
-      {/* Disclaimer */}
-      <div style={styles.section}>
-        <h2 style={styles.sectionTitle}>Important Information</h2>
-        <div style={styles.disclaimerBox}>
-          <p>
-            <strong>This is an estimate only.</strong> Terms are subject to verification of credit, 
-            property value, income, employment, and all other lending requirements.
-          </p>
-          <p style={{marginTop: '12px'}}>
-            To receive a firm offer with locked rates and terms, you must complete a full application 
-            and receive written approval from a loan officer.
-          </p>
+        {/* Disclaimer + footer kept together so the footer never lands alone on its own page */}
+        <div style={{ breakInside: 'avoid', pageBreakInside: 'avoid' }}>
+          <div style={styles.section}>
+            <h2 style={styles.sectionTitle}>Important Information</h2>
+            <div style={styles.disclaimerBox}>
+              <p>
+                <strong>This is an estimate only.</strong> Terms are subject to verification of credit,
+                property value, income, employment, and all other lending requirements.
+              </p>
+              <p style={{marginTop: '12px'}}>
+                To receive a firm offer with locked rates and terms, you must complete a full application
+                and receive written approval from a loan officer.
+              </p>
+            </div>
+          </div>
+
+          <div style={styles.termSheetFooter}>
+            This is an automated estimate and has NOT been reviewed by a loan officer.
+          </div>
         </div>
       </div>
 
       {/* Action Buttons */}
-      <div style={styles.actionButtons}>
+      <div style={styles.actionButtons} className="no-print">
         <button onClick={() => window.location.href = '/apply'} style={styles.applyButton}>
           Apply Now & Lock in Your Rate
         </button>
         <button onClick={shareViaEmail} style={styles.secondaryButton}>📧 Share</button>
         <button onClick={downloadPDF} style={styles.secondaryButton}>⬇️ Download PDF</button>
+        <button onClick={printQuote} style={styles.secondaryButton}>🖨️ Print Quote</button>
         <button onClick={onBack} style={styles.secondaryButton}>← Back</button>
       </div>
     </div>
@@ -2034,6 +2174,8 @@ const styles = {
     marginBottom: '30px',
     color: '#5a4a28',
     display: 'flex',
+    breakInside: 'avoid',
+    pageBreakInside: 'avoid',
     gap: '12px'
   },
   warningText: {
@@ -2053,13 +2195,15 @@ const styles = {
     color: '#1a1a1a'
   },
   infoGrid: {
-    display: 'grid',
-    gridTemplateColumns: 'repeat(auto-fit, minmax(250px, 1fr))',
+    display: 'flex',
+    flexWrap: 'wrap',
     gap: '16px'
   },
   infoItem: {
     display: 'flex',
-    flexDirection: 'column'
+    flexDirection: 'column',
+    flex: '1 1 220px',
+    minWidth: '220px'
   },
   infoLabel: {
     fontSize: '12px',
@@ -2079,18 +2223,28 @@ const styles = {
     marginLeft: '8px'
   },
   quoteOptionsGrid: {
-    display: 'grid',
-    gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))',
+    display: 'flex',
+    flexWrap: 'wrap',
     gap: '16px'
   },
   quoteOptionCard: {
     backgroundColor: '#f9f9f9',
     borderRadius: '8px',
     padding: '20px',
-    border: '1px solid #eee',
+    border: '2px solid #eee',
     display: 'flex',
     flexDirection: 'column',
-    gap: '10px'
+    gap: '10px',
+    breakInside: 'avoid',
+    pageBreakInside: 'avoid',
+    flex: '1 1 220px',
+    minWidth: '220px',
+    cursor: 'pointer',
+    textAlign: 'left'
+  },
+  quoteOptionCardSelected: {
+    border: '2px solid #0066cc',
+    backgroundColor: '#f0f7ff'
   },
   quoteOptionLabel: {
     fontSize: '14px',
@@ -2107,6 +2261,76 @@ const styles = {
     justifyContent: 'space-between',
     fontSize: '13px',
     color: '#333'
+  },
+  quoteOptionCashOut: {
+    display: 'flex',
+    justifyContent: 'space-between',
+    fontSize: '14px',
+    fontWeight: 'bold',
+    color: '#1E6F49',
+    marginTop: '4px',
+    paddingTop: '8px',
+    borderTop: '1px dashed #ccc'
+  },
+  letterheadHeader: {
+    textAlign: 'center',
+    marginBottom: '10px'
+  },
+  letterheadLender: {
+    fontSize: '16px',
+    fontWeight: '700',
+    color: '#1a1a1a',
+    letterSpacing: '0.5px'
+  },
+  selectedQuoteBox: {
+    backgroundColor: '#f0f7ff',
+    border: '2px solid #0066cc',
+    borderRadius: '10px',
+    padding: '24px',
+    textAlign: 'center',
+    marginBottom: '20px',
+    breakInside: 'avoid',
+    pageBreakInside: 'avoid'
+  },
+  selectedQuoteLabel: {
+    fontSize: '13px',
+    fontWeight: '600',
+    color: '#555',
+    textTransform: 'uppercase',
+    letterSpacing: '0.5px',
+    marginBottom: '8px'
+  },
+  selectedQuotePayment: {
+    fontSize: '44px',
+    fontWeight: 'bold',
+    color: '#0066cc',
+    lineHeight: '1.1'
+  },
+  selectedQuoteMeta: {
+    fontSize: '14px',
+    color: '#333',
+    marginTop: '8px'
+  },
+  cashOutDisclaimerBox: {
+    backgroundColor: '#fff8e1',
+    border: '1px solid #e0c068',
+    borderRadius: '8px',
+    padding: '16px',
+    marginTop: '16px',
+    color: '#5a4a28',
+    fontSize: '13px',
+    breakInside: 'avoid',
+    pageBreakInside: 'avoid',
+    lineHeight: '1.6',
+    whiteSpace: 'pre-line'
+  },
+  termSheetFooter: {
+    textAlign: 'center',
+    fontSize: '12px',
+    color: '#666',
+    borderTop: '1px solid #ddd',
+    paddingTop: '16px',
+    marginTop: '10px'
   },
   prequalToggle: {
     display: 'inline-block',
@@ -2191,7 +2415,9 @@ const styles = {
     backgroundColor: '#f9f9f9',
     borderRadius: '8px',
     padding: '16px',
-    border: '1px solid #eee'
+    border: '1px solid #eee',
+    breakInside: 'avoid',
+    pageBreakInside: 'avoid'
   },
   feeRow: {
     display: 'flex',
@@ -2219,7 +2445,9 @@ const styles = {
     borderRadius: '8px',
     padding: '16px',
     color: '#333',
-    lineHeight: '1.6'
+    lineHeight: '1.6',
+    breakInside: 'avoid',
+    pageBreakInside: 'avoid'
   },
   actionButtons: {
     display: 'grid',
