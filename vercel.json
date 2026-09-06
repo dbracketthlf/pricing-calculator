@@ -1,0 +1,5 @@
+web: node arive-webhook-server.js{
+  "buildCommand": "npm run build",
+  "outputDirectory": "dist",
+  "framework": "vite"
+}
