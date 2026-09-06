@@ -7,35 +7,76 @@ import React, { useState, useEffect } from 'react';
  */
 
 const PricingCalculatorApp = () => {
-  const [activeTab, setActiveTab] = useState('calculator'); // 'calculator' or 'admin'
+  const [activeTab, setActiveTab] = useState('prequal'); // 'prequal' | 'calculator' | 'admin'
   const [adminPassword, setAdminPassword] = useState('');
   const [adminAuth, setAdminAuth] = useState(false);
 
+  // Lifted to this top level (rather than local to each tab) so filled-in
+  // data survives switching tabs, per the "data persists" requirement.
+  const [prequalForm, setPrequalForm] = useState(getDefaultPrequalForm);
+  const [prequalResults, setPrequalResults] = useState(null);
+  const [calculatorPrefill, setCalculatorPrefill] = useState(null);
+
+  const handleGetDetailedQuote = (program, lender) => {
+    setCalculatorPrefill({
+      seq: Date.now(),
+      product: mapLoanTypeToProduct(program.loanType),
+      occupancy: mapPrequalOccupancy(prequalForm.occupancy),
+      lenderName: lender.name,
+      programLoanType: program.loanType
+    });
+    setActiveTab('calculator');
+  };
+
   return (
     <div style={styles.appContainer}>
-      {!adminAuth ? (
-        <>
-          {activeTab === 'calculator' ? (
-            <CalculatorTab setActiveTab={setActiveTab} />
-          ) : (
-            <AdminLoginTab 
-              password={adminPassword}
-              setPassword={setAdminPassword}
-              onAuth={() => setAdminAuth(true)}
-              onBack={() => setActiveTab('calculator')}
-            />
-          )}
-          {activeTab === 'calculator' && (
-            <button 
-              onClick={() => setActiveTab('admin')}
-              style={styles.adminLink}
-            >
-              Admin →
-            </button>
-          )}
-        </>
-      ) : (
-        <AdminDashboard onLogout={() => { setAdminAuth(false); setActiveTab('calculator'); }} />
+      <div style={styles.mainNav}>
+        <button
+          onClick={() => setActiveTab('prequal')}
+          style={{ ...styles.mainNavButton, ...(activeTab === 'prequal' ? styles.mainNavButtonActive : {}) }}
+        >
+          Pre-Qualification
+        </button>
+        <button
+          onClick={() => setActiveTab('calculator')}
+          style={{ ...styles.mainNavButton, ...(activeTab === 'calculator' ? styles.mainNavButtonActive : {}) }}
+        >
+          Calculator
+        </button>
+        <button
+          onClick={() => setActiveTab('admin')}
+          style={{ ...styles.mainNavButton, ...(activeTab === 'admin' ? styles.mainNavButtonActive : {}) }}
+        >
+          Admin
+        </button>
+      </div>
+
+      {activeTab === 'prequal' && (
+        <PreQualTab
+          formData={prequalForm}
+          setFormData={setPrequalForm}
+          results={prequalResults}
+          setResults={setPrequalResults}
+          onGetDetailedQuote={handleGetDetailedQuote}
+        />
+      )}
+      {activeTab === 'calculator' && (
+        <CalculatorTab
+          prefill={calculatorPrefill}
+          onPrefillConsumed={() => setCalculatorPrefill(null)}
+        />
+      )}
+      {activeTab === 'admin' && (
+        adminAuth ? (
+          <AdminDashboard onLogout={() => { setAdminAuth(false); setActiveTab('prequal'); }} />
+        ) : (
+          <AdminLoginTab
+            password={adminPassword}
+            setPassword={setAdminPassword}
+            onAuth={() => setAdminAuth(true)}
+            onBack={() => setActiveTab('prequal')}
+          />
+        )
       )}
     </div>
   );
@@ -44,7 +85,7 @@ const PricingCalculatorApp = () => {
 /**
  * MAIN CALCULATOR TAB
  */
-const CalculatorTab = ({ setActiveTab }) => {
+const CalculatorTab = ({ prefill, onPrefillConsumed }) => {
   const [selectedProduct, setSelectedProduct] = useState('fha');
   const [formData, setFormData] = useState({
     borrowerName: '',
@@ -126,6 +167,15 @@ const CalculatorTab = ({ setActiveTab }) => {
   const isHELOC = selectedProduct === 'heloc';
   const isHELoan = selectedProduct === 'heloan';
   const recommendation = getRecommendation(selectedProduct, formData);
+
+  useEffect(() => {
+    if (!prefill) return;
+    setSelectedProduct(prefill.product);
+    if (prefill.occupancy) {
+      setFormData(prev => ({ ...prev, occupancyType: prefill.occupancy }));
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [prefill?.seq]);
 
   const handleInputChange = (e) => {
     const { name, value, type, checked } = e.target;
@@ -277,6 +327,15 @@ const CalculatorTab = ({ setActiveTab }) => {
         <h1 style={styles.heading}>Get Your Loan Estimate</h1>
         <p style={styles.subheading}>Select a loan type and enter your details</p>
       </div>
+
+      {prefill && (
+        <div style={styles.prequalBanner}>
+          <span>
+            Pre-Qualified via <strong>{prefill.lenderName}</strong> — {prefill.programLoanType}. Loan type below has been pre-selected as a starting point.
+          </span>
+          <button onClick={onPrefillConsumed} style={styles.prequalBannerDismiss} aria-label="Dismiss">×</button>
+        </div>
+      )}
 
       {error && (
         <div style={styles.errorBox}>
@@ -607,6 +666,197 @@ const CalculatorTab = ({ setActiveTab }) => {
           Calculate My Estimate
         </button>
       </form>
+    </div>
+  );
+};
+
+/**
+ * PRE-QUALIFICATION TAB
+ */
+const PreQualTab = ({ formData, setFormData, results, setResults, onGetDetailedQuote }) => {
+  const [matrix, setMatrix] = useState({ lenders: [], programs: [] });
+  const [loadState, setLoadState] = useState('loading'); // 'loading' | 'ready' | 'error'
+
+  useEffect(() => {
+    let cancelled = false;
+    fetchLenderMatrix()
+      .then(data => { if (!cancelled) { setMatrix(data); setLoadState('ready'); } })
+      .catch(() => { if (!cancelled) setLoadState('error'); });
+    return () => { cancelled = true; };
+  }, []);
+
+  const set = (key, value) => setFormData(prev => ({ ...prev, [key]: value }));
+  const toggleIncome = (type) => setFormData(prev => ({
+    ...prev,
+    incomeTypes: prev.incomeTypes.includes(type)
+      ? prev.incomeTypes.filter(t => t !== type)
+      : [...prev.incomeTypes, type]
+  }));
+
+  const runMatch = (e) => {
+    e.preventDefault();
+    const crit = {
+      purpose: formData.purpose,
+      propertyType: formData.propertyType,
+      occupancy: formData.occupancy,
+      incomeTypes: formData.incomeTypes,
+      fico: formData.creditScore,
+      state: formData.state.toUpperCase(),
+      loanAmount: formData.loanAmount,
+      propertyValue: formData.propertyValue,
+      ltv: (formData.propertyValue && formData.loanAmount)
+        ? (Number(formData.loanAmount) / Number(formData.propertyValue)) * 100
+        : null
+    };
+    const matches = [];
+    matrix.programs.forEach(program => {
+      const lender = matrix.lenders.find(l => l.id === program.lenderId);
+      if (!lender) return;
+      const result = evaluatePrequalProgram(program, lender, crit);
+      if (result) matches.push(result);
+    });
+    matches.sort((a, b) => (b.maxLoanAvail || 0) - (a.maxLoanAvail || 0));
+    setResults(matches);
+  };
+
+  const uniqueLenderNames = results ? [...new Set(results.map(r => r.lender.name))] : [];
+
+  return (
+    <div style={styles.calculatorContainer}>
+      <div style={styles.calculatorHeader}>
+        <h1 style={styles.heading}>Pre-Qualification</h1>
+        <p style={styles.subheading}>See which lenders you may qualify with in seconds</p>
+      </div>
+
+      {loadState === 'error' && (
+        <div style={styles.errorBox}>
+          <span>⚠️</span> Couldn't load the lender matrix right now. Please try again shortly.
+        </div>
+      )}
+
+      <form onSubmit={runMatch} style={styles.form}>
+        <div style={styles.formGroup}>
+          <label style={styles.label}>Loan Purpose</label>
+          <select style={styles.select} value={formData.purpose} onChange={e => set('purpose', e.target.value)}>
+            <option value="purchase">Purchase</option>
+            <option value="refi">Refinance (Rate & Term)</option>
+            <option value="cashout">Cash-Out Refinance</option>
+          </select>
+        </div>
+
+        <div style={styles.formGroup}>
+          <label style={styles.label}>Property Type</label>
+          <select style={styles.select} value={formData.propertyType} onChange={e => set('propertyType', e.target.value)}>
+            {PREQUAL_PROP_TYPES.map(t => <option key={t} value={t}>{t}</option>)}
+          </select>
+        </div>
+
+        <div style={styles.formGroup}>
+          <label style={styles.label}>Occupancy</label>
+          <select style={styles.select} value={formData.occupancy} onChange={e => set('occupancy', e.target.value)}>
+            {PREQUAL_OCC_TYPES.map(t => <option key={t} value={t}>{t}</option>)}
+          </select>
+        </div>
+
+        <div style={styles.formGroup}>
+          <label style={styles.label}>Income Source(s) — select all that apply</label>
+          <div>
+            {PREQUAL_INCOME_TYPES.map(t => (
+              <button
+                type="button"
+                key={t}
+                onClick={() => toggleIncome(t)}
+                style={{
+                  ...styles.prequalToggle,
+                  ...(formData.incomeTypes.includes(t) ? styles.prequalToggleActive : {})
+                }}
+              >
+                {t}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        <div style={styles.formGroup}>
+          <label style={styles.label}>Estimated Credit Score</label>
+          <select style={styles.select} value={formData.creditScore} onChange={e => set('creditScore', e.target.value)}>
+            <option value="750">Excellent (750+)</option>
+            <option value="725">Good (700-749)</option>
+            <option value="680">Fair (660-699)</option>
+            <option value="620">Poor (Below 660)</option>
+          </select>
+        </div>
+
+        <div style={styles.formGroup}>
+          <label style={styles.label}>Loan Amount</label>
+          <input
+            type="number"
+            style={styles.input}
+            value={formData.loanAmount}
+            onChange={e => set('loanAmount', e.target.value)}
+            placeholder="$400,000"
+          />
+        </div>
+
+        <div style={styles.formGroup}>
+          <label style={styles.label}>Estimated Property Value (optional — improves match accuracy)</label>
+          <input
+            type="number"
+            style={styles.input}
+            value={formData.propertyValue}
+            onChange={e => set('propertyValue', e.target.value)}
+            placeholder="$500,000"
+          />
+        </div>
+
+        <div style={styles.formGroup}>
+          <label style={styles.label}>Property State</label>
+          <select style={styles.select} value={formData.state} onChange={e => set('state', e.target.value)}>
+            <option value="">Select a state</option>
+            {PREQUAL_US_STATES.map(s => <option key={s} value={s}>{s}</option>)}
+          </select>
+        </div>
+
+        <button type="submit" style={styles.submitButton} disabled={loadState !== 'ready'}>
+          {loadState === 'loading' ? 'Loading lender data…' : 'Check My Options'}
+        </button>
+      </form>
+
+      {results !== null && (
+        <div style={{ marginTop: '30px' }}>
+          {results.length === 0 ? (
+            <div style={styles.errorBox}>
+              <span>ⓘ</span> No lender partner matches this scenario yet. Try adjusting your inputs, or contact us directly.
+            </div>
+          ) : (
+            <>
+              <div style={styles.prequalSummary}>
+                You qualify for: <strong>{uniqueLenderNames.join(', ')}</strong>
+              </div>
+              {results.map(r => (
+                <div key={r.program.id} style={styles.prequalResultCard}>
+                  <div style={styles.prequalResultHeader}>
+                    <span style={styles.prequalResultLender}>{r.lender.name}</span>
+                    <span style={styles.prequalResultProgram}>{r.program.loanType}</span>
+                  </div>
+                  <div>
+                    {(r.program.docTypes || []).map(d => (
+                      <span key={d} style={styles.prequalChip}>{d}</span>
+                    ))}
+                  </div>
+                  <div style={styles.prequalResultDetails}>
+                    {r.maxLtv && <span>Max LTV {r.maxLtv}%</span>}
+                    {r.maxLoanAvail != null && <span>Est. max loan here: ${r.maxLoanAvail.toLocaleString()}</span>}
+                  </div>
+                  <button style={styles.prequalQuoteButton} onClick={() => onGetDetailedQuote(r.program, r.lender)}>
+                    Get Detailed Quote
+                  </button>
+                </div>
+              ))}
+            </>
+          )}
+        </div>
+      )}
     </div>
   );
 };
@@ -1158,6 +1408,240 @@ const AdminAuditTab = () => {
  * UTILITY FUNCTIONS
  */
 
+/**
+ * PRE-QUALIFICATION (Lender Matrix / Supabase)
+ */
+
+const LENDER_MATRIX_SUPABASE_URL = 'https://olnxljyztebwfnjsqzbd.supabase.co';
+const LENDER_MATRIX_SUPABASE_KEY = 'sb_publishable_fhpEMb9qE9_dU8MRCbB2KA_czs0_yPF';
+const LENDER_MATRIX_STORE_KEY = 'lendermatrix:db';
+
+const PREQUAL_PROP_TYPES = ['SFR', 'Condo', '2-4 Unit', 'Multifamily 5+', 'Mixed Use', 'Manufactured', 'Land'];
+const PREQUAL_OCC_TYPES = ['Owner Occupied', 'Second Home', 'Investment'];
+const PREQUAL_INCOME_TYPES = ['W-2 Employee', 'Self-Employed', '1099 Contractor', 'Retirement / Pension', 'Social Security', 'Rental Income', 'Investment / Dividend', 'Child Support / Alimony', 'Disability', 'Bonus / Commission'];
+// States where the brokerage holds a license. Outside these, only investment
+// loans through lenders that explicitly allow unlicensed states are eligible.
+const PREQUAL_LICENSED_STATES = ['AZ', 'CA', 'CO', 'FL', 'ID', 'TX', 'TN'];
+const PREQUAL_US_STATES = ['AL', 'AK', 'AZ', 'AR', 'CA', 'CO', 'CT', 'DE', 'DC', 'FL', 'GA', 'HI', 'ID', 'IL', 'IN', 'IA', 'KS', 'KY', 'LA', 'ME', 'MD', 'MA', 'MI', 'MN', 'MS', 'MO', 'MT', 'NE', 'NV', 'NH', 'NJ', 'NM', 'NY', 'NC', 'ND', 'OH', 'OK', 'OR', 'PA', 'RI', 'SC', 'SD', 'TN', 'TX', 'UT', 'VT', 'VA', 'WA', 'WV', 'WI', 'WY'];
+
+function getDefaultPrequalForm() {
+  return {
+    purpose: 'purchase',
+    propertyType: 'SFR',
+    occupancy: 'Owner Occupied',
+    incomeTypes: [],
+    creditScore: '750',
+    loanAmount: '',
+    propertyValue: '',
+    state: ''
+  };
+}
+
+// Read-only fetch against the same Supabase project the internal Lender
+// Matrix tool uses. This app never writes to it.
+async function fetchLenderMatrix() {
+  const res = await fetch(
+    `${LENDER_MATRIX_SUPABASE_URL}/rest/v1/kv_store?key=eq.${encodeURIComponent(LENDER_MATRIX_STORE_KEY)}&select=value`,
+    {
+      headers: {
+        apikey: LENDER_MATRIX_SUPABASE_KEY,
+        Authorization: `Bearer ${LENDER_MATRIX_SUPABASE_KEY}`
+      }
+    }
+  );
+  if (!res.ok) throw new Error(`Lender matrix request failed (${res.status})`);
+  const rows = await res.json();
+  if (!rows.length) return { lenders: [], programs: [] };
+  const parsed = JSON.parse(rows[0].value);
+  return { lenders: parsed.lenders || [], programs: parsed.programs || [] };
+}
+
+// Maps a wholesale lender's program name (e.g. "Velvet Cake DSCR") onto one
+// of this app's own internal calculator products. The Calculator keeps using
+// its own rate sheets/margins regardless - this only pre-selects a sensible
+// starting loan type.
+function mapLoanTypeToProduct(loanType) {
+  const s = (loanType || '').toLowerCase();
+  if (s.includes('heloc')) return 'heloc';
+  if (s.includes('closed-end second') || s.includes('closed end second') || s.includes('heloan')) return 'heloan';
+  if (s.includes('fha')) return 'fha';
+  if (/\bva\b/.test(s)) return 'va';
+  if (s.includes('conventional') || s.includes('jumbo') || s.includes('usda')) return 'conventional';
+  return 'nonQm';
+}
+
+function mapPrequalOccupancy(occupancy) {
+  if (occupancy === 'Investment') return 'investment';
+  if (occupancy === 'Second Home') return 'second_home';
+  return 'primary';
+}
+
+// The live lender matrix has inconsistent purpose labels across programs
+// entered at different times ("Rate-Term" vs "R/T Refi", "Cash-Out" vs
+// "Cash Out"), so match by keyword rather than exact string.
+function purposeMatches(programPurposes, borrowerPurpose) {
+  if (!programPurposes || !programPurposes.length) return true;
+  const list = programPurposes.map(p => p.toLowerCase());
+  if (borrowerPurpose === 'purchase') return list.some(p => p.includes('purchase'));
+  if (borrowerPurpose === 'cashout') return list.some(p => p.includes('cash'));
+  return list.some(p => p.includes('rate') || p.includes('r/t'));
+}
+
+// A borrower doesn't know lending jargon like "Full Doc" vs "Bank
+// Statement" - they pick income sources instead, and we translate that into
+// the doc/qualification types those sources would actually support.
+function candidateDocTypes(incomeTypes, occupancy) {
+  const docs = [];
+  if (occupancy === 'Investment') docs.push('DSCR');
+  if (incomeTypes.includes('Self-Employed')) docs.push('Bank Statement', 'P&L Only', 'Alt Doc');
+  if (incomeTypes.includes('1099 Contractor')) docs.push('1099 Only');
+  const wageLike = ['W-2 Employee', 'Retirement / Pension', 'Social Security', 'Disability', 'Child Support / Alimony', 'Bonus / Commission'];
+  if (incomeTypes.some(i => wageLike.includes(i))) docs.push('Full Doc');
+  if (incomeTypes.includes('Rental Income') || incomeTypes.includes('Investment / Dividend')) docs.push('Asset Depletion', 'Full Doc');
+  if (!docs.length) docs.push('Full Doc');
+  return [...new Set(docs)];
+}
+
+function docKeywordSetFor(candidates) {
+  const map = {
+    'DSCR': 'dscr',
+    'Bank Statement': 'bank statement',
+    'P&L Only': 'p&l',
+    'Alt Doc': 'alt doc',
+    '1099 Only': '1099',
+    'Full Doc': 'full doc',
+    'Asset Depletion': 'asset'
+  };
+  return new Set(candidates.map(c => map[c] || c.toLowerCase()));
+}
+
+// A program's own advertised doc-type list uses a looser vocabulary than the
+// tier matrix (e.g. "Bank Statement (12-Month)", "1099" instead of "1099
+// Only") - substring match against derived keywords instead of exact equality.
+function docTypeMatches(programDocTypes, keywordSet) {
+  if (!programDocTypes || !programDocTypes.length) return true;
+  return programDocTypes.some(d => {
+    const dl = d.toLowerCase();
+    return [...keywordSet].some(k => dl.includes(k));
+  });
+}
+
+// A program's matrix is rows of { fico (floor), doc, occ, lien, purpose,
+// dscr (min DSCR floor), maxLtv, maxLoan }, each "" meaning "any". The
+// applicable row: among rows matching the deal's doc/occupancy/lien/purpose,
+// the one with the highest FICO (then DSCR) floor the deal meets, and within
+// that band, the tightest LTV bracket the deal's LTV fits into.
+function comboTiers(p, crit = {}) {
+  return (p.tiers || [])
+    .filter(t => t.fico !== '' && t.fico != null)
+    .filter(t => !crit.occ || !t.occ || t.occ === crit.occ)
+    .filter(t => !crit.lien || !t.lien || t.lien === crit.lien)
+    .filter(t => !crit.purpose || !t.purpose || t.purpose === crit.purpose)
+    .filter(t => !crit.doc || !t.doc || t.doc === crit.doc)
+    .sort((a, b) => (Number(b.fico) - Number(a.fico)) || (Number(b.dscr || 0) - Number(a.dscr || 0)));
+}
+
+function tierFor(p, crit = {}) {
+  const anyTiers = (p.tiers || []).some(t => t.fico !== '' && t.fico != null);
+  if (!anyTiers) return { hasTiers: false, tier: null, belowAll: false, noComboRows: false };
+  const rows = comboTiers(p, crit);
+  if (!rows.length) return { hasTiers: true, tier: null, belowAll: false, noComboRows: true };
+  if (!crit.fico) return { hasTiers: true, tier: null, belowAll: false, noComboRows: false };
+
+  const qualifies = rows.filter(x =>
+    Number(crit.fico) >= Number(x.fico) &&
+    (!crit.dscr || !x.dscr || Number(crit.dscr) >= Number(x.dscr))
+  );
+  if (!qualifies.length) return { hasTiers: true, tier: null, belowAll: true, noComboRows: false };
+
+  const topFico = Math.max(...qualifies.map(x => Number(x.fico)));
+  let band = qualifies.filter(x => Number(x.fico) === topFico);
+
+  const metDscrFloors = band.filter(x => x.dscr).map(x => Number(x.dscr)).filter(v => !crit.dscr || Number(crit.dscr) >= v);
+  if (crit.dscr && metDscrFloors.length) {
+    const topDscr = Math.max(...metDscrFloors);
+    band = band.filter(x => !x.dscr || Number(x.dscr) === topDscr);
+  }
+
+  if (crit.ltv) {
+    const fits = band.filter(x => !x.maxLtv || Number(crit.ltv) <= Number(x.maxLtv));
+    if (fits.length) {
+      const chosen = fits.reduce((best, x) => {
+        const bl = Number(best.maxLtv || Infinity), xl = Number(x.maxLtv || Infinity);
+        if (xl < bl) return x;
+        if (xl === bl && Number(x.maxLoan || 0) > Number(best.maxLoan || 0)) return x;
+        return best;
+      });
+      return { hasTiers: true, tier: chosen, belowAll: false, noComboRows: false };
+    }
+    const loosest = band.reduce((best, x) => Number(x.maxLtv || 0) > Number(best.maxLtv || 0) ? x : best);
+    return { hasTiers: true, tier: loosest, belowAll: false, noComboRows: false, ltvOver: true };
+  }
+
+  const bestCase = band.reduce((best, x) => Number(x.maxLoan || 0) > Number(best.maxLoan || 0) ? x : best);
+  return { hasTiers: true, tier: bestCase, belowAll: false, noComboRows: false };
+}
+
+// Full eligibility check for one program against a borrower's pre-qual
+// scenario. Returns null if disqualified, or a match summary otherwise.
+// Unlike the internal loan-officer tool this is based on, there is no
+// "near miss" coaching here - a public-facing tool either shows a program as
+// qualifying or it doesn't.
+function evaluatePrequalProgram(program, lender, crit) {
+  if ((program.occTypes || []).length && !program.occTypes.includes(crit.occupancy)) return null;
+  if (!purposeMatches(program.purposes, crit.purpose)) return null;
+  if ((program.propTypes || []).length && !program.propTypes.includes(crit.propertyType)) return null;
+
+  const inUnlicensedState = crit.state && !PREQUAL_LICENSED_STATES.includes(crit.state);
+  if (inUnlicensedState) {
+    if (!lender.unlicensedStatesOk) return null;
+    if (crit.occupancy !== 'Investment') return null;
+  }
+  if (crit.state && (lender.states || []).length && !lender.states.includes(crit.state)) return null;
+  if (program.states && program.states.trim() && program.states.trim().toUpperCase() !== 'ALL') {
+    const list = program.states.toUpperCase().split(/[,\s]+/).filter(Boolean);
+    if (crit.state && !list.includes(crit.state)) return null;
+  }
+
+  const candidates = candidateDocTypes(crit.incomeTypes, crit.occupancy);
+  if (!docTypeMatches(program.docTypes, docKeywordSetFor(candidates))) return null;
+
+  const hasAnyTiers = (program.tiers || []).some(t => t.fico !== '' && t.fico != null);
+  let chosenTier = null;
+  let maxLoanAvail = null;
+
+  if (hasAnyTiers) {
+    let best = null;
+    for (const doc of [...candidates, undefined]) {
+      const r = tierFor(program, { fico: crit.fico, ltv: crit.ltv, doc, occ: crit.occupancy, purpose: crit.purpose });
+      if (r.tier && !r.belowAll && !r.noComboRows) {
+        const capByLtv = (crit.propertyValue && r.tier.maxLtv)
+          ? Math.floor((Number(r.tier.maxLtv) / 100) * Number(crit.propertyValue))
+          : null;
+        const capByLoan = r.tier.maxLoan ? Number(r.tier.maxLoan) : null;
+        const caps = [capByLtv, capByLoan].filter(v => v != null);
+        const avail = caps.length ? Math.min(...caps) : null;
+        if (!best || (avail || 0) > (best.avail || 0)) best = { tier: r.tier, avail };
+      }
+    }
+    if (!best) return null;
+    chosenTier = best.tier;
+    maxLoanAvail = best.avail;
+  }
+
+  const effLtv = chosenTier?.maxLtv || program.maxLtv || null;
+  const effMaxLoan = chosenTier?.maxLoan || program.maxLoan || null;
+
+  if (crit.loanAmount) {
+    const amt = Number(crit.loanAmount);
+    if (program.minLoan && amt < Number(program.minLoan)) return null;
+    if (effMaxLoan && amt > Number(effMaxLoan)) return null;
+  }
+  if (crit.ltv && effLtv && Number(crit.ltv) > Number(effLtv)) return null;
+
+  return { program, lender, maxLtv: effLtv, maxLoan: effMaxLoan, maxLoanAvail };
+}
+
 function getRecommendation(selectedProduct, formData) {
   if (['heloc', 'heloan', 'va'].includes(selectedProduct)) return null;
 
@@ -1274,17 +1758,48 @@ const styles = {
     backgroundColor: '#f5f5f5',
     minHeight: '100vh'
   },
-  adminLink: {
-    position: 'fixed',
-    bottom: '20px',
-    right: '20px',
-    padding: '8px 12px',
-    backgroundColor: '#999',
-    color: '#fff',
+  mainNav: {
+    display: 'flex',
+    justifyContent: 'center',
+    gap: '4px',
+    backgroundColor: '#1a1a1a',
+    padding: '0 20px'
+  },
+  mainNavButton: {
+    padding: '16px 24px',
+    backgroundColor: 'transparent',
     border: 'none',
-    borderRadius: '4px',
+    borderBottom: '3px solid transparent',
+    color: '#aaa',
+    fontSize: '15px',
+    fontWeight: '600',
+    cursor: 'pointer'
+  },
+  mainNavButtonActive: {
+    color: '#fff',
+    borderBottom: '3px solid #0066cc'
+  },
+  prequalBanner: {
+    backgroundColor: '#eaf2fe',
+    border: '1px solid #b8d4f5',
+    borderRadius: '8px',
+    padding: '12px 16px',
+    marginBottom: '20px',
+    color: '#1a4d8f',
+    fontSize: '14px',
+    display: 'flex',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    gap: '12px'
+  },
+  prequalBannerDismiss: {
+    background: 'none',
+    border: 'none',
+    color: '#1a4d8f',
+    fontSize: '20px',
+    lineHeight: '1',
     cursor: 'pointer',
-    fontSize: '12px'
+    padding: '0 4px'
   },
   calculatorContainer: {
     maxWidth: '900px',
@@ -1495,6 +2010,85 @@ const styles = {
     justifyContent: 'space-between',
     fontSize: '13px',
     color: '#333'
+  },
+  prequalToggle: {
+    display: 'inline-block',
+    padding: '8px 14px',
+    marginRight: '8px',
+    marginBottom: '8px',
+    borderRadius: '20px',
+    border: '1px solid #ddd',
+    backgroundColor: '#fff',
+    color: '#333',
+    fontSize: '13px',
+    cursor: 'pointer'
+  },
+  prequalToggleActive: {
+    backgroundColor: '#0066cc',
+    borderColor: '#0066cc',
+    color: '#fff'
+  },
+  prequalSummary: {
+    backgroundColor: '#eaf2fe',
+    border: '1px solid #b8d4f5',
+    borderRadius: '8px',
+    padding: '14px 16px',
+    marginBottom: '16px',
+    color: '#1a4d8f',
+    fontSize: '15px'
+  },
+  prequalResultCard: {
+    backgroundColor: '#f9f9f9',
+    borderRadius: '8px',
+    padding: '16px',
+    border: '1px solid #eee',
+    borderLeft: '4px solid #1E6F49',
+    marginBottom: '14px'
+  },
+  prequalResultHeader: {
+    display: 'flex',
+    justifyContent: 'space-between',
+    alignItems: 'baseline',
+    marginBottom: '8px',
+    flexWrap: 'wrap',
+    gap: '6px'
+  },
+  prequalResultLender: {
+    fontSize: '16px',
+    fontWeight: 'bold',
+    color: '#1a1a1a'
+  },
+  prequalResultProgram: {
+    fontSize: '13px',
+    color: '#A87F2F'
+  },
+  prequalChip: {
+    display: 'inline-block',
+    fontSize: '12px',
+    padding: '3px 8px',
+    marginRight: '6px',
+    marginTop: '6px',
+    borderRadius: '4px',
+    backgroundColor: '#E4F0E9',
+    color: '#1E6F49'
+  },
+  prequalResultDetails: {
+    display: 'flex',
+    gap: '16px',
+    fontSize: '13px',
+    color: '#555',
+    marginTop: '10px'
+  },
+  prequalQuoteButton: {
+    marginTop: '12px',
+    padding: '10px 18px',
+    backgroundColor: '#1a1a1a',
+    color: '#fff',
+    border: 'none',
+    borderRadius: '6px',
+    fontSize: '13px',
+    fontWeight: '600',
+    cursor: 'pointer'
   },
   feesBox: {
     backgroundColor: '#f9f9f9',
