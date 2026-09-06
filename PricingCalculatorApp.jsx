@@ -796,14 +796,6 @@ const AdminLoginTab = ({ password, setPassword, onAuth, onBack }) => {
 
 const AdminDashboard = ({ onLogout }) => {
   const [activeTab, setActiveTab] = useState('rates');
-  const [uploadedSheets, setUploadedSheets] = useState({
-    fha: { investor_a: 'fha_20250810.csv', investor_b: null, investor_c: null },
-    va: { investor_a: 'va_20250810.csv', investor_b: null, investor_c: null },
-    conventional: { investor_a: 'conv_20250810.csv', investor_b: null, investor_c: null },
-    nonQm: { investor_a: 'nonqm_20250810.csv', investor_b: null, investor_c: null },
-    heloc: { investor_a: 'heloc_20250810.csv', investor_b: null, investor_c: null },
-    heloan: { investor_a: 'heloan_20250810.csv', investor_b: null, investor_c: null }
-  });
 
   return (
     <div style={styles.adminDashboard}>
@@ -813,19 +805,25 @@ const AdminDashboard = ({ onLogout }) => {
       </div>
 
       <div style={styles.adminTabs}>
-        <button 
+        <button
           onClick={() => setActiveTab('rates')}
           style={{...styles.tabButton, ...(activeTab === 'rates' ? styles.tabButtonActive : {})}}
         >
           Rate Sheets
         </button>
-        <button 
+        <button
+          onClick={() => setActiveTab('margins')}
+          style={{...styles.tabButton, ...(activeTab === 'margins' ? styles.tabButtonActive : {})}}
+        >
+          Profit Margins
+        </button>
+        <button
           onClick={() => setActiveTab('fees')}
           style={{...styles.tabButton, ...(activeTab === 'fees' ? styles.tabButtonActive : {})}}
         >
           Fees & Comp
         </button>
-        <button 
+        <button
           onClick={() => setActiveTab('audit')}
           style={{...styles.tabButton, ...(activeTab === 'audit' ? styles.tabButtonActive : {})}}
         >
@@ -833,72 +831,244 @@ const AdminDashboard = ({ onLogout }) => {
         </button>
       </div>
 
-      {activeTab === 'rates' && (
-        <AdminRatesTab uploadedSheets={uploadedSheets} setUploadedSheets={setUploadedSheets} />
-      )}
+      {activeTab === 'rates' && <AdminRatesTab />}
+      {activeTab === 'margins' && <AdminMarginsTab />}
       {activeTab === 'fees' && <AdminFeesTab />}
       {activeTab === 'audit' && <AdminAuditTab />}
     </div>
   );
 };
 
-const AdminRatesTab = ({ uploadedSheets, setUploadedSheets }) => {
-  const products = ['fha', 'va', 'conventional', 'nonQm', 'heloc', 'heloan'];
-  const productNames = {
-    fha: 'FHA',
-    va: 'VA',
-    conventional: 'Conventional',
-    nonQm: 'Non-QM',
-    heloc: 'HELOC',
-    heloan: 'HELoan'
+const RATE_SHEETS_STORAGE_KEY = 'pricingCalc_rateSheets';
+const REQUIRED_RATE_SHEET_COLUMNS = ['lender', 'product', 'credit_tier', 'ltv_start', 'ltv_end', 'base_rate'];
+
+function loadRateSheets() {
+  try {
+    const saved = localStorage.getItem(RATE_SHEETS_STORAGE_KEY);
+    return saved ? JSON.parse(saved) : [];
+  } catch (err) {
+    return [];
+  }
+}
+
+function parseRateSheetCsv(text) {
+  const lines = text.split(/\r\n|\n|\r/).filter(line => line.trim() !== '');
+  if (lines.length === 0) {
+    return { error: 'File is empty.' };
+  }
+
+  const header = lines[0].split(',').map(h => h.trim().toLowerCase());
+  const missing = REQUIRED_RATE_SHEET_COLUMNS.filter(col => !header.includes(col));
+  if (missing.length > 0) {
+    return { error: `Missing required column(s): ${missing.join(', ')}` };
+  }
+
+  const rows = [];
+  for (let i = 1; i < lines.length; i++) {
+    const cells = lines[i].split(',').map(c => c.trim());
+    if (cells.length !== header.length) {
+      return { error: `Row ${i + 1} has ${cells.length} column(s), expected ${header.length}.` };
+    }
+    const row = {};
+    header.forEach((col, idx) => { row[col] = cells[idx]; });
+    if ([row.ltv_start, row.ltv_end, row.base_rate].some(v => v === '' || isNaN(parseFloat(v)))) {
+      return { error: `Row ${i + 1} has a non-numeric ltv_start, ltv_end, or base_rate value.` };
+    }
+    rows.push(row);
+  }
+
+  if (rows.length === 0) {
+    return { error: 'CSV has a header row but no data rows.' };
+  }
+
+  return { rows };
+}
+
+const AdminRatesTab = () => {
+  const [sheets, setSheets] = useState(loadRateSheets);
+  const [uploadError, setUploadError] = useState('');
+
+  const persist = (next) => {
+    setSheets(next);
+    localStorage.setItem(RATE_SHEETS_STORAGE_KEY, JSON.stringify(next));
+  };
+
+  const handleFileChange = (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setUploadError('');
+
+    const reader = new FileReader();
+    reader.onload = (event) => {
+      const result = parseRateSheetCsv(String(event.target.result));
+      if (result.error) {
+        setUploadError(`${file.name}: ${result.error}`);
+        return;
+      }
+      const sheet = {
+        id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        filename: file.name,
+        lenders: [...new Set(result.rows.map(r => r.lender))],
+        products: [...new Set(result.rows.map(r => r.product))],
+        rowCount: result.rows.length,
+        rows: result.rows,
+        uploadedDate: new Date().toLocaleString('en-US')
+      };
+      persist([sheet, ...sheets]);
+    };
+    reader.onerror = () => setUploadError(`${file.name}: Could not read file.`);
+    reader.readAsText(file);
+    e.target.value = '';
+  };
+
+  const handleDelete = (id) => {
+    persist(sheets.filter(s => s.id !== id));
   };
 
   return (
     <div style={styles.adminTab}>
-      <h2>Upload Rate Sheets by Product</h2>
-      
-      {products.map(product => (
-        <div key={product} style={styles.productSection}>
-          <h3>{productNames[product]}</h3>
-          
-          {['investor_a', 'investor_b', 'investor_c'].map(investor => (
-            <div key={investor} style={styles.investorRow}>
-              <span>{investor.replace('_', ' ').toUpperCase()}</span>
-              <input
-                type="file"
-                accept=".csv"
-                onChange={(e) => {
-                  const file = e.target.files?.[0];
-                  if (file) {
-                    setUploadedSheets(prev => ({
-                      ...prev,
-                      [product]: {
-                        ...prev[product],
-                        [investor]: file.name
-                      }
-                    }));
-                  }
-                }}
-                style={styles.fileInput}
-              />
-              {uploadedSheets[product][investor] && (
-                <span style={styles.uploadedBadge}>✓ {uploadedSheets[product][investor]}</span>
-              )}
-            </div>
-          ))}
+      <h2>Rate Sheets</h2>
 
-          <div style={styles.investorPriority}>
-            <label style={styles.label}>Priority Order</label>
-            <div style={styles.priorityList}>
-              <div>1. Investor A</div>
-              <div>2. Investor B</div>
-              <div>3. Investor C</div>
+      <div style={styles.formGroup}>
+        <label style={styles.label}>Upload Rate Sheet (CSV)</label>
+        <input type="file" accept=".csv" onChange={handleFileChange} style={styles.fileInput} />
+        <p style={styles.feeNote}>Required columns: {REQUIRED_RATE_SHEET_COLUMNS.join(', ')}</p>
+      </div>
+
+      {uploadError && (
+        <div style={styles.errorBox}>
+          <span>⚠️</span> {uploadError}
+        </div>
+      )}
+
+      {sheets.length === 0 ? (
+        <p style={styles.feeNote}>No rate sheets uploaded yet.</p>
+      ) : (
+        sheets.map(sheet => (
+          <div key={sheet.id} style={styles.productSection}>
+            <div style={{ ...styles.investorRow, justifyContent: 'space-between' }}>
+              <div>
+                <strong>{sheet.filename}</strong>
+                <div style={styles.feeNote}>
+                  Lender(s): {sheet.lenders.join(', ')} · Product(s): {sheet.products.join(', ')} · {sheet.rowCount} row(s) · Uploaded {sheet.uploadedDate}
+                </div>
+              </div>
+              <button onClick={() => handleDelete(sheet.id)} style={styles.logoutButton}>Delete</button>
             </div>
           </div>
-        </div>
-      ))}
+        ))
+      )}
+    </div>
+  );
+};
 
-      <button style={styles.submitButton}>Save All Rate Sheets</button>
+const MARGINS_STORAGE_KEY = 'pricingCalc_profitMargins';
+const DEFAULT_MARGINS = {
+  licensedRate: 337.5,
+  unlicensedRate: 375,
+  exceptionRate: 375,
+  exceptionStates: ['NV', 'NC', 'MN', 'ND', 'SD', 'UT', 'VT']
+};
+
+function loadMargins() {
+  try {
+    const saved = localStorage.getItem(MARGINS_STORAGE_KEY);
+    if (saved) return { ...DEFAULT_MARGINS, ...JSON.parse(saved) };
+  } catch (err) {}
+  return DEFAULT_MARGINS;
+}
+
+const AdminMarginsTab = () => {
+  const [margins, setMargins] = useState(loadMargins);
+  const [draft, setDraft] = useState(() => ({
+    licensedRate: margins.licensedRate,
+    unlicensedRate: margins.unlicensedRate,
+    exceptionRate: margins.exceptionRate,
+    exceptionStatesText: margins.exceptionStates.join(', ')
+  }));
+  const [justSaved, setJustSaved] = useState(false);
+
+  const handleSave = () => {
+    const exceptionStates = draft.exceptionStatesText
+      .split(/[,\s]+/)
+      .map(s => s.trim().toUpperCase())
+      .filter(Boolean);
+    const updated = {
+      licensedRate: parseFloat(draft.licensedRate) || 0,
+      unlicensedRate: parseFloat(draft.unlicensedRate) || 0,
+      exceptionRate: parseFloat(draft.exceptionRate) || 0,
+      exceptionStates
+    };
+    localStorage.setItem(MARGINS_STORAGE_KEY, JSON.stringify(updated));
+    setMargins(updated);
+    setJustSaved(true);
+    setTimeout(() => setJustSaved(false), 2000);
+  };
+
+  return (
+    <div style={styles.adminTab}>
+      <h2>Profit Margins</h2>
+
+      <div style={styles.marginsCurrentBox}>
+        <div style={styles.marginsCurrentRow}>
+          <span>Licensed States:</span>
+          <strong>{margins.licensedRate} bps</strong>
+        </div>
+        <div style={styles.marginsCurrentRow}>
+          <span>Unlicensed States:</span>
+          <strong>{margins.unlicensedRate} bps</strong>
+        </div>
+        <div style={styles.marginsCurrentRow}>
+          <span>Exception States ({margins.exceptionStates.join(', ') || 'none'}):</span>
+          <strong>{margins.exceptionRate} bps</strong>
+        </div>
+      </div>
+
+      <div style={styles.feeForm}>
+        <div style={styles.feeInput}>
+          <label>Licensed State Rate (bps): </label>
+          <input
+            type="number"
+            step="0.1"
+            value={draft.licensedRate}
+            onChange={(e) => setDraft(prev => ({ ...prev, licensedRate: e.target.value }))}
+            style={styles.input}
+          />
+        </div>
+        <div style={styles.feeInput}>
+          <label>Unlicensed State Rate (bps): </label>
+          <input
+            type="number"
+            step="0.1"
+            value={draft.unlicensedRate}
+            onChange={(e) => setDraft(prev => ({ ...prev, unlicensedRate: e.target.value }))}
+            style={styles.input}
+          />
+        </div>
+        <div style={styles.feeInput}>
+          <label>Exception State Rate (bps): </label>
+          <input
+            type="number"
+            step="0.1"
+            value={draft.exceptionRate}
+            onChange={(e) => setDraft(prev => ({ ...prev, exceptionRate: e.target.value }))}
+            style={styles.input}
+          />
+        </div>
+        <div style={styles.feeInput}>
+          <label>Exception States: </label>
+          <input
+            type="text"
+            value={draft.exceptionStatesText}
+            onChange={(e) => setDraft(prev => ({ ...prev, exceptionStatesText: e.target.value }))}
+            placeholder="NV, NC, MN, ND, SD, UT, VT"
+            style={styles.input}
+          />
+        </div>
+      </div>
+
+      <button onClick={handleSave} style={styles.submitButton}>Save Profit Margins</button>
+      {justSaved && <span style={styles.savedBadge}>Saved ✓</span>}
     </div>
   );
 };
@@ -1424,7 +1594,7 @@ const styles = {
   },
   tabButtonActive: {
     color: '#0066cc',
-    borderBottomColor: '#0066cc'
+    borderBottom: '2px solid #0066cc'
   },
   adminTab: {
     backgroundColor: '#fff',
@@ -1445,21 +1615,24 @@ const styles = {
   fileInput: {
     flex: 1
   },
-  uploadedBadge: {
-    backgroundColor: '#dff0d8',
-    color: '#3c763d',
-    padding: '4px 8px',
-    borderRadius: '3px',
-    fontSize: '12px'
-  },
-  investorPriority: {
-    marginTop: '15px',
-    padding: '10px',
+  marginsCurrentBox: {
     backgroundColor: '#f9f9f9',
-    borderRadius: '4px'
+    borderRadius: '8px',
+    padding: '16px',
+    border: '1px solid #eee',
+    marginBottom: '20px'
   },
-  priorityList: {
-    marginTop: '8px'
+  marginsCurrentRow: {
+    display: 'flex',
+    justifyContent: 'space-between',
+    padding: '6px 0',
+    fontSize: '14px'
+  },
+  savedBadge: {
+    marginLeft: '12px',
+    color: '#3c763d',
+    fontSize: '14px',
+    fontWeight: '600'
   },
   feesSection: {
     marginBottom: '30px'
