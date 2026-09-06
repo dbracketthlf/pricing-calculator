@@ -18,13 +18,43 @@ const PricingCalculatorApp = () => {
   const [calculatorPrefill, setCalculatorPrefill] = useState(null);
 
   const handleGetDetailedQuote = (program, lender) => {
-    setCalculatorPrefill({
+    const product = mapLoanTypeToProduct(program.loanType);
+    const isMortgageProduct = ['fha', 'va', 'conventional', 'nonQm'].includes(product);
+    const amount = prequalForm.loanAmount ? Number(prequalForm.loanAmount) : null;
+    const value = prequalForm.propertyValue ? Number(prequalForm.propertyValue) : null;
+
+    const prefill = {
       seq: Date.now(),
-      product: mapLoanTypeToProduct(program.loanType),
-      occupancy: mapPrequalOccupancy(prequalForm.occupancy),
+      product,
       lenderName: lender.name,
-      programLoanType: program.loanType
-    });
+      programLoanType: program.loanType,
+      purpose: prequalForm.purpose,
+      propertyType: mapPrequalPropertyType(prequalForm.propertyType),
+      occupancyType: mapPrequalOccupancy(prequalForm.occupancy),
+      estimatedCreditScore: prequalForm.creditScore,
+      docType: derivePrequalDocType(prequalForm.incomeTypes, prequalForm.occupancy)
+    };
+
+    if (isMortgageProduct) {
+      if (prequalForm.purpose === 'purchase') {
+        if (value) {
+          prefill.purchasePrice = String(value);
+          if (amount) prefill.downPaymentPercent = (((value - amount) / value) * 100).toFixed(1);
+        }
+      } else {
+        if (value) prefill.currentPropertyValue = String(value);
+        // For a rate/term refi the requested loan amount IS the balance being
+        // refinanced. For cash-out, "loan amount" is balance + cash out
+        // combined, and we have no reliable way to split that - leave
+        // currentBalance/cashOutAmount for the borrower to fill in themselves
+        // rather than guess a wrong split.
+        if (prequalForm.purpose === 'refi' && amount) prefill.currentBalance = String(amount);
+      }
+    } else if (value) {
+      prefill.propertyValue = String(value);
+    }
+
+    setCalculatorPrefill(prefill);
     setActiveTab('calculator');
   };
 
@@ -111,7 +141,8 @@ const CalculatorTab = ({ prefill, onPrefillConsumed }) => {
     // Non-QM only
     docType: 'bank_statements',
     prepaymentPenaltyYears: '5',
-    selfEmployed: false
+    selfEmployed: false,
+    lenderName: ''
   });
 
   const [termSheet, setTermSheet] = useState(null);
@@ -171,9 +202,20 @@ const CalculatorTab = ({ prefill, onPrefillConsumed }) => {
   useEffect(() => {
     if (!prefill) return;
     setSelectedProduct(prefill.product);
-    if (prefill.occupancy) {
-      setFormData(prev => ({ ...prev, occupancyType: prefill.occupancy }));
-    }
+    setFormData(prev => ({
+      ...prev,
+      ...(prefill.lenderName && { lenderName: prefill.lenderName }),
+      ...(prefill.purpose && { loanPurpose: prefill.purpose }),
+      ...(prefill.propertyType && { propertyType: prefill.propertyType }),
+      ...(prefill.occupancyType && { occupancyType: prefill.occupancyType }),
+      ...(prefill.estimatedCreditScore && { estimatedCreditScore: prefill.estimatedCreditScore }),
+      ...(prefill.docType && { docType: prefill.docType }),
+      ...(prefill.purchasePrice && { purchasePrice: prefill.purchasePrice }),
+      ...(prefill.downPaymentPercent && { downPaymentPercent: prefill.downPaymentPercent }),
+      ...(prefill.currentPropertyValue && { currentPropertyValue: prefill.currentPropertyValue }),
+      ...(prefill.currentBalance && { currentBalance: prefill.currentBalance }),
+      ...(prefill.propertyValue && { propertyValue: prefill.propertyValue })
+    }));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [prefill?.seq]);
 
@@ -288,6 +330,7 @@ const CalculatorTab = ({ prefill, onPrefillConsumed }) => {
         product: selectedProduct,
         productName: PRODUCTS[selectedProduct].label,
         borrowerName: formData.borrowerName,
+        lenderName: formData.lenderName,
         propertyAddress: formData.propertyAddress,
         loanAmount: loanAmount.toFixed(0),
         ltv: ltv.toFixed(2),
@@ -363,6 +406,19 @@ const CalculatorTab = ({ prefill, onPrefillConsumed }) => {
             <option value="heloc">HELOC</option>
             <option value="heloan">HELoan</option>
           </select>
+        </div>
+
+        {/* Lender (carried over from Pre-Qualification, if any) */}
+        <div style={styles.formGroup}>
+          <label style={styles.label}>Lender (optional)</label>
+          <input
+            type="text"
+            name="lenderName"
+            value={formData.lenderName}
+            onChange={handleInputChange}
+            placeholder="e.g. Cake - Broker"
+            style={styles.input}
+          />
         </div>
 
         {/* Non-QM Doc Type */}
@@ -914,6 +970,12 @@ const TermSheetDisplay = ({ termSheet, onBack }) => {
             <span style={styles.infoLabel}>Property:</span>
             <span style={styles.infoValue}>{termSheet.propertyAddress || 'Not provided'}</span>
           </div>
+          {termSheet.lenderName && (
+            <div style={styles.infoItem}>
+              <span style={styles.infoLabel}>Lender:</span>
+              <span style={styles.infoValue}>{termSheet.lenderName}</span>
+            </div>
+          )}
           <div style={styles.infoItem}>
             <span style={styles.infoLabel}>Loan Amount:</span>
             <span style={styles.infoValue}>${parseFloat(termSheet.loanAmount).toLocaleString('en-US', {maximumFractionDigits: 0})}</span>
@@ -1476,6 +1538,31 @@ function mapPrequalOccupancy(occupancy) {
   return 'primary';
 }
 
+// The Calculator's Property Type field only has 3 buckets (no manufactured/
+// land/5+ unit options), so map onto the closest one.
+function mapPrequalPropertyType(propertyType) {
+  const map = {
+    'SFR': 'single_family',
+    'Condo': 'condo',
+    '2-4 Unit': 'multi_unit',
+    'Multifamily 5+': 'multi_unit',
+    'Mixed Use': 'multi_unit'
+  };
+  return map[propertyType] || 'single_family';
+}
+
+// The Calculator's Non-QM doc type field predates DSCR being modeled
+// separately, so an investment/DSCR scenario maps onto "Assets" (the
+// closest existing bucket - qualification based on the deal, not personal
+// income) rather than a dedicated DSCR option that doesn't exist there.
+function derivePrequalDocType(incomeTypes, occupancy) {
+  if (occupancy === 'Investment') return 'assets';
+  if (incomeTypes.includes('Self-Employed')) return 'bank_statements';
+  if (incomeTypes.includes('1099 Contractor')) return '1099s';
+  if (incomeTypes.includes('Rental Income') || incomeTypes.includes('Investment / Dividend')) return 'assets';
+  return 'bank_statements';
+}
+
 // The live lender matrix has inconsistent purpose labels across programs
 // entered at different times ("Rate-Term" vs "R/T Refi", "Cash-Out" vs
 // "Cash Out"), so match by keyword rather than exact string.
@@ -1536,7 +1623,11 @@ function comboTiers(p, crit = {}) {
     .filter(t => t.fico !== '' && t.fico != null)
     .filter(t => !crit.occ || !t.occ || t.occ === crit.occ)
     .filter(t => !crit.lien || !t.lien || t.lien === crit.lien)
-    .filter(t => !crit.purpose || !t.purpose || t.purpose === crit.purpose)
+    // Tier rows use human-readable labels ("Purchase", "Rate-Term",
+    // "Cash-Out") that don't line up 1:1 with our internal purpose values
+    // ('purchase'/'refi'/'cashout') - match by keyword, not exact equality,
+    // same as the top-level purposeMatches() check.
+    .filter(t => !crit.purpose || !t.purpose || purposeMatches([t.purpose], crit.purpose))
     .filter(t => !crit.doc || !t.doc || t.doc === crit.doc)
     .sort((a, b) => (Number(b.fico) - Number(a.fico)) || (Number(b.dscr || 0) - Number(a.dscr || 0)));
 }
@@ -1590,6 +1681,12 @@ function tierFor(p, crit = {}) {
 function evaluatePrequalProgram(program, lender, crit) {
   if ((program.occTypes || []).length && !program.occTypes.includes(crit.occupancy)) return null;
   if (!purposeMatches(program.purposes, crit.purpose)) return null;
+  // A program restricted to 2nd-lien only (e.g. a standalone HELOC or
+  // closed-end second) can't be the sole loan on a purchase - it requires an
+  // existing 1st mortgage already in place. Some of these have an empty
+  // `purposes` array (meaning "unrestricted" everywhere else), which would
+  // otherwise wrongly let them match a Purchase scenario.
+  if (crit.purpose === 'purchase' && (program.liens || []).length && !program.liens.includes('1st')) return null;
   if ((program.propTypes || []).length && !program.propTypes.includes(crit.propertyType)) return null;
 
   const inUnlicensedState = crit.state && !PREQUAL_LICENSED_STATES.includes(crit.state);
