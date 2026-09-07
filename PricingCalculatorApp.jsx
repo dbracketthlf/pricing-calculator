@@ -1281,12 +1281,19 @@ const AdminDashboard = ({ onLogout }) => {
         >
           Audit Log
         </button>
+        <button
+          onClick={() => setActiveTab('converter')}
+          style={{...styles.tabButton, ...(activeTab === 'converter' ? styles.tabButtonActive : {})}}
+        >
+          Rate Sheet Converter
+        </button>
       </div>
 
       {activeTab === 'rates' && <AdminRatesTab />}
       {activeTab === 'margins' && <AdminMarginsTab />}
       {activeTab === 'fees' && <AdminFeesTab />}
       {activeTab === 'audit' && <AdminAuditTab />}
+      {activeTab === 'converter' && <AdminConverterTab />}
     </div>
   );
 };
@@ -1570,6 +1577,612 @@ const AdminRatesTab = () => {
             </div>
           </div>
         ))
+      )}
+    </div>
+  );
+};
+
+/**
+ * RATE SHEET CONVERTER (raw extraction + interactive column mapping)
+ *
+ * Deliberately does NOT reuse parseRateSheetCsv/parseExcelRateSheet/
+ * parsePdfRateSheet above - those already validate against the fixed
+ * standard schema, but this tool's whole purpose is handling files whose
+ * columns DON'T match it yet. The extraction logic below is very similar
+ * (same sheet-picking and PDF text-clustering approach) but intentionally
+ * kept separate so the already-shipped Rate Sheets upload can't regress.
+ */
+
+const STANDARD_RATE_COLUMNS = [
+  { key: 'lender', label: 'Lender', required: true, canBeFixed: true, help: 'The wholesale lender or investor name (e.g. "NMSI", "UWM", "Cake"). Often not a column at all if the file is a single lender\'s own sheet - use "Same value for every row" in that case.' },
+  { key: 'product', label: 'Product', required: true, canBeFixed: true, help: 'The loan program name (e.g. "Prime Conforming", "FHA 203b", "Non-QM").' },
+  { key: 'credit_tier', label: 'Credit Tier', required: true, canBeFixed: false, help: 'The credit score band this rate applies to (e.g. "FICO 740-759", "Excellent", "780+").' },
+  { key: 'ltv_start', label: 'LTV Start', required: true, canBeFixed: false, help: 'Lower bound of the LTV range (e.g. "60").' },
+  { key: 'ltv_end', label: 'LTV End', required: true, canBeFixed: false, help: 'Upper bound of the LTV range (e.g. "65").' },
+  { key: 'base_rate', label: 'Base Rate', required: true, canBeFixed: false, help: 'The interest rate for this row (e.g. "6.250"). If the file has several rate columns (15-day, 30-day, points variants...), pick the one you want to use here.' },
+  { key: 'state', label: 'State', required: false, canBeFixed: true, help: 'Optional - only if the sheet varies pricing by state.' },
+  { key: 'occupancy', label: 'Occupancy', required: false, canBeFixed: true, help: 'Optional - Owner Occupied, Investment, Second Home, etc.' },
+  { key: 'qualification_method', label: 'Qualification Method', required: false, canBeFixed: true, help: 'Optional - Full Doc, Bank Statement, DSCR, etc.' },
+  { key: 'effective_date', label: 'Effective Date', required: false, canBeFixed: true, help: 'Optional - the date this rate sheet took effect.' }
+];
+
+const LENDER_PRESETS = {
+  nmsi: {
+    label: 'NMSI',
+    fixedLender: 'NMSI',
+    columnHints: {
+      product: [/product/i, /program/i],
+      credit_tier: [/fico/i, /credit/i],
+      ltv_start: [/ltv.*(start|from|low|min)/i],
+      ltv_end: [/ltv.*(end|to|high|max)/i],
+      base_rate: [/30.?day.*rate/i, /\brate\b/i],
+      state: [/state/i],
+      occupancy: [/occup/i],
+      qualification_method: [/doc.*type/i, /qualif/i]
+    }
+  },
+  uwm: {
+    label: 'UWM',
+    fixedLender: 'UWM',
+    columnHints: {
+      product: [/product/i, /program/i],
+      credit_tier: [/fico/i, /credit.*score/i],
+      ltv_start: [/ltv.*(start|from|low|min)/i],
+      ltv_end: [/ltv.*(end|to|high|max)/i],
+      base_rate: [/\brate\b/i, /price/i],
+      state: [/state/i],
+      occupancy: [/occup/i]
+    }
+  },
+  cake: {
+    label: 'Cake',
+    fixedLender: 'Cake',
+    columnHints: {
+      product: [/product/i, /program/i, /loan.?type/i],
+      credit_tier: [/fico/i, /credit/i],
+      ltv_start: [/ltv.*(start|from|low|min)/i],
+      ltv_end: [/ltv.*(end|to|high|max)/i],
+      base_rate: [/\brate\b/i]
+    }
+  },
+  pennymac: {
+    label: 'PennyMac',
+    fixedLender: 'PennyMac',
+    columnHints: {
+      product: [/product/i, /program/i],
+      credit_tier: [/fico/i, /credit/i],
+      ltv_start: [/ltv.*(start|from|low|min)/i],
+      ltv_end: [/ltv.*(end|to|high|max)/i],
+      base_rate: [/\brate\b/i]
+    }
+  },
+  homexpress: {
+    label: 'Home Xpress',
+    fixedLender: 'Home Xpress',
+    columnHints: {
+      product: [/product/i, /program/i],
+      credit_tier: [/fico/i, /credit/i],
+      ltv_start: [/ltv.*(start|from|low|min)/i],
+      ltv_end: [/ltv.*(end|to|high|max)/i],
+      base_rate: [/\brate\b/i],
+      state: [/state/i],
+      occupancy: [/occup/i]
+    }
+  }
+};
+
+const GENERIC_COLUMN_HINTS = {
+  lender: [/^lender$/i, /lender.?name/i],
+  product: [/^product$/i, /program/i],
+  credit_tier: [/fico/i, /credit/i],
+  ltv_start: [/ltv.*(start|from|low|min)/i],
+  ltv_end: [/ltv.*(end|to|high|max)/i],
+  base_rate: [/^rate$/i, /\brate\b/i, /\bapr\b/i],
+  state: [/^state$/i],
+  occupancy: [/occup/i],
+  qualification_method: [/doc.?type/i, /qualif/i],
+  effective_date: [/effective/i, /^date$/i]
+};
+
+function extractCsvTableRaw(text) {
+  const lines = text.split(/\r\n|\n|\r/).filter(line => line.trim() !== '');
+  if (lines.length === 0) return { error: 'File is empty.' };
+  const header = lines[0].split(',').map(h => h.trim());
+  const rows = lines.slice(1).map(line => line.split(',').map(c => c.trim()));
+  return { header, rows };
+}
+
+async function extractExcelTableRaw(file) {
+  const XLSX = await import('xlsx');
+  let workbook;
+  try {
+    const buffer = await file.arrayBuffer();
+    workbook = XLSX.read(buffer, { type: 'array' });
+  } catch (err) {
+    return { error: `Could not read ${file.name}. Please upload a valid PDF, Excel, or CSV file.` };
+  }
+  for (const sheetName of workbook.SheetNames) {
+    const data = XLSX.utils.sheet_to_json(workbook.Sheets[sheetName], { header: 1, raw: false, blankrows: false });
+    if (data.length >= 2 && (data[0] || []).length >= 2) {
+      return { header: (data[0] || []).map(h => String(h ?? '').trim()), rows: data.slice(1) };
+    }
+  }
+  return { error: `Could not find a data table in ${file.name}. Please upload a valid PDF, Excel, or CSV file.` };
+}
+
+async function extractPdfTableRaw(file) {
+  const [pdfjsLib, pdfjsWorkerUrlModule] = await Promise.all([
+    import('pdfjs-dist'),
+    import('pdfjs-dist/build/pdf.worker.min.mjs?url')
+  ]);
+  pdfjsLib.GlobalWorkerOptions.workerSrc = pdfjsWorkerUrlModule.default;
+
+  let pdf;
+  try {
+    const buffer = await file.arrayBuffer();
+    pdf = await pdfjsLib.getDocument({ data: buffer }).promise;
+  } catch (err) {
+    return { error: `Could not read ${file.name}. Please upload a valid PDF, Excel, or CSV file.` };
+  }
+
+  const items = [];
+  for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {
+    const page = await pdf.getPage(pageNum);
+    const content = await page.getTextContent();
+    content.items.forEach(item => {
+      if (!item.str || !item.str.trim()) return;
+      items.push({ text: item.str.trim(), x: item.transform[4], y: item.transform[5], page: pageNum, width: item.width || 0 });
+    });
+  }
+  if (!items.length) {
+    return { error: `Could not read ${file.name}. Please upload a valid PDF, Excel, or CSV file.` };
+  }
+
+  const rowMap = new Map();
+  items.forEach(it => {
+    const key = `${it.page}:${Math.round(it.y)}`;
+    if (!rowMap.has(key)) rowMap.set(key, []);
+    rowMap.get(key).push(it);
+  });
+
+  const rowsRaw = [...rowMap.keys()]
+    .map(key => {
+      const [p, y] = key.split(':').map(Number);
+      return { page: p, y, items: rowMap.get(key) };
+    })
+    .sort((a, b) => a.page - b.page || b.y - a.y)
+    .map(r => r.items.sort((a, b) => a.x - b.x));
+
+  const COLUMN_GAP_THRESHOLD = 8;
+  const tableRows = rowsRaw
+    .map(rowItems => {
+      const cols = [];
+      let current = rowItems[0].text;
+      let currentEnd = rowItems[0].x + rowItems[0].width;
+      for (let i = 1; i < rowItems.length; i++) {
+        const gap = rowItems[i].x - currentEnd;
+        if (gap > COLUMN_GAP_THRESHOLD) {
+          cols.push(current);
+          current = rowItems[i].text;
+        } else {
+          current += ' ' + rowItems[i].text;
+        }
+        currentEnd = rowItems[i].x + rowItems[i].width;
+      }
+      cols.push(current);
+      return cols;
+    })
+    .filter(cols => cols.length > 1);
+
+  if (tableRows.length < 2) {
+    return { error: `Could not find a data table in ${file.name}. Please upload a valid PDF, Excel, or CSV file.` };
+  }
+
+  return { header: tableRows[0].map(h => h.trim()), rows: tableRows.slice(1) };
+}
+
+function autoSuggestMapping(header, presetKey) {
+  const preset = presetKey ? LENDER_PRESETS[presetKey] : null;
+  const suggestion = {};
+  STANDARD_RATE_COLUMNS.forEach(col => {
+    const patterns = [...((preset && preset.columnHints[col.key]) || []), ...(GENERIC_COLUMN_HINTS[col.key] || [])];
+    const match = header.find(h => patterns.some(p => p.test(h)));
+    if (match) suggestion[col.key] = { mode: 'column', column: match, fixedValue: '' };
+  });
+  if (preset?.fixedLender && !suggestion.lender) {
+    suggestion.lender = { mode: 'fixed', column: '', fixedValue: preset.fixedLender };
+  }
+  return suggestion;
+}
+
+function normalizeCreditTier(value) {
+  return String(value ?? '').trim().replace(/^FICO\s+/i, '');
+}
+
+// "60.01-65" -> ["60.01", "65"]; returns [null, null] if it doesn't look like a range.
+function splitLtvRange(value) {
+  const s = String(value ?? '').trim();
+  const m = s.match(/^([\d.]+)\s*(?:-|to|–)\s*([\d.]+)$/i);
+  if (!m) return [null, null];
+  return [m[1], m[2]];
+}
+
+function convertConverterRow(rawRow, header, mapping, singleLtvRangeMode, ltvRangeColumn) {
+  const get = (colName) => {
+    const idx = header.indexOf(colName);
+    return idx >= 0 ? String(rawRow[idx] ?? '').trim() : '';
+  };
+  const resolve = (key) => {
+    const m = mapping[key];
+    if (!m || m.mode === 'none') return '';
+    if (m.mode === 'fixed') return m.fixedValue;
+    return m.column ? get(m.column) : '';
+  };
+
+  const out = {
+    lender: resolve('lender'),
+    product: resolve('product'),
+    credit_tier: normalizeCreditTier(resolve('credit_tier')),
+    base_rate: resolve('base_rate')
+  };
+
+  if (singleLtvRangeMode) {
+    const [s, e] = splitLtvRange(get(ltvRangeColumn));
+    out.ltv_start = s;
+    out.ltv_end = e;
+  } else {
+    out.ltv_start = resolve('ltv_start');
+    out.ltv_end = resolve('ltv_end');
+  }
+
+  ['state', 'occupancy', 'qualification_method', 'effective_date'].forEach(key => {
+    const v = resolve(key);
+    if (v !== '') out[key] = v;
+  });
+
+  return out;
+}
+
+function validateConvertedRow(row) {
+  if (!row.lender) return 'missing lender';
+  if (!row.product) return 'missing product';
+  if (!row.credit_tier) return 'missing credit_tier';
+  if (row.ltv_start === null || row.ltv_start === '' || isNaN(parseFloat(row.ltv_start))) return 'invalid or missing ltv_start';
+  if (row.ltv_end === null || row.ltv_end === '' || isNaN(parseFloat(row.ltv_end))) return 'invalid or missing ltv_end';
+  if (row.base_rate === '' || isNaN(parseFloat(row.base_rate))) return 'invalid or missing base_rate';
+  return null;
+}
+
+function isConverterMappingComplete(mapping, singleLtvRangeMode, ltvRangeColumn) {
+  const isSet = (m) => !!m && ((m.mode === 'column' && m.column) || (m.mode === 'fixed' && m.fixedValue.trim() !== ''));
+  if (!['lender', 'product', 'credit_tier', 'base_rate'].every(key => isSet(mapping[key]))) return false;
+  if (singleLtvRangeMode) return !!ltvRangeColumn;
+  return isSet(mapping.ltv_start) && isSet(mapping.ltv_end);
+}
+
+function buildConverterCsv(rows) {
+  const optionalPresent = ['state', 'occupancy', 'qualification_method', 'effective_date'].filter(key => rows.some(r => r[key] !== undefined));
+  const columns = [...REQUIRED_RATE_SHEET_COLUMNS, ...optionalPresent];
+  const escape = (v) => {
+    const s = String(v ?? '');
+    return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+  };
+  const lines = [columns.join(',')];
+  rows.forEach(r => lines.push(columns.map(c => escape(r[c])).join(',')));
+  return lines.join('\n');
+}
+
+function downloadTextFile(filename, text, mimeType) {
+  const blob = new Blob([text], { type: mimeType });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
+function getConverterMappingDefault() {
+  return Object.fromEntries(STANDARD_RATE_COLUMNS.map(c => [c.key, { mode: 'column', column: '', fixedValue: '' }]));
+}
+
+const AdminConverterTab = () => {
+  const [step, setStep] = useState('upload'); // 'upload' | 'map' | 'preview'
+  const [fileError, setFileError] = useState('');
+  const [fileName, setFileName] = useState('');
+  const [table, setTable] = useState(null); // { header, rows }
+  const [presetKey, setPresetKey] = useState('');
+  const [mapping, setMapping] = useState(getConverterMappingDefault);
+  const [singleLtvRangeMode, setSingleLtvRangeMode] = useState(false);
+  const [ltvRangeColumn, setLtvRangeColumn] = useState('');
+  const [showAllRateColumns, setShowAllRateColumns] = useState(false);
+  const [mappingError, setMappingError] = useState('');
+
+  const resetAll = () => {
+    setStep('upload');
+    setFileError('');
+    setFileName('');
+    setTable(null);
+    setPresetKey('');
+    setMapping(getConverterMappingDefault());
+    setSingleLtvRangeMode(false);
+    setLtvRangeColumn('');
+    setShowAllRateColumns(false);
+    setMappingError('');
+  };
+
+  const handleFile = async (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setFileError('');
+    const name = file.name.toLowerCase();
+
+    let result;
+    if (name.endsWith('.csv')) {
+      result = extractCsvTableRaw(await file.text());
+    } else if (name.endsWith('.xlsx') || name.endsWith('.xls')) {
+      result = await extractExcelTableRaw(file);
+    } else if (name.endsWith('.pdf')) {
+      result = await extractPdfTableRaw(file);
+    } else {
+      setFileError('Please upload a valid PDF, Excel, or CSV file.');
+      e.target.value = '';
+      return;
+    }
+
+    if (result.error) {
+      setFileError(result.error);
+      e.target.value = '';
+      return;
+    }
+
+    setFileName(file.name);
+    setTable(result);
+    setMapping({ ...getConverterMappingDefault(), ...autoSuggestMapping(result.header, '') });
+    setStep('map');
+    e.target.value = '';
+  };
+
+  const applyPreset = (key) => {
+    setPresetKey(key);
+    if (!table) return;
+    setMapping({ ...getConverterMappingDefault(), ...autoSuggestMapping(table.header, key) });
+  };
+
+  const setColumnMapping = (key, column) => {
+    setMapping(prev => ({ ...prev, [key]: { mode: 'column', column, fixedValue: '' } }));
+  };
+  const setFixedMapping = (key, fixedValue) => {
+    setMapping(prev => ({ ...prev, [key]: { mode: 'fixed', column: '', fixedValue } }));
+  };
+  const setMappingMode = (key, mode) => {
+    setMapping(prev => ({ ...prev, [key]: { ...prev[key], mode } }));
+  };
+
+  const goToPreview = () => {
+    if (!isConverterMappingComplete(mapping, singleLtvRangeMode, ltvRangeColumn)) {
+      setMappingError('Please map all required columns (marked with *).');
+      return;
+    }
+    setMappingError('');
+    setStep('preview');
+  };
+
+  const converted = table
+    ? table.rows.map(r => convertConverterRow(r, table.header, mapping, singleLtvRangeMode, ltvRangeColumn))
+    : [];
+  const rowErrors = converted
+    .map((row, idx) => ({ idx, error: validateConvertedRow(row) }))
+    .filter(x => x.error);
+  const validRows = converted.filter((row, idx) => !rowErrors.some(e => e.idx === idx));
+
+  const handleDownload = () => {
+    const csv = buildConverterCsv(validRows);
+    const base = fileName.replace(/\.[^.]+$/, '') || 'rate-sheet';
+    downloadTextFile(`${base}-converted.csv`, csv, 'text/csv');
+  };
+
+  const rateLikeColumns = table ? table.header.filter(h => /rate|price/i.test(h)) : [];
+
+  const STEPS = [
+    { id: 'upload', label: '1. Upload' },
+    { id: 'map', label: '2. Map' },
+    { id: 'preview', label: '3. Preview & Download' }
+  ];
+
+  return (
+    <div style={styles.adminTab}>
+      <h2>Rate Sheet Converter</h2>
+      <p style={styles.feeNote}>
+        Convert any lender's rate sheet (PDF, Excel, or CSV) into the standard format this app expects, then
+        download it and upload it on the Rate Sheets tab. No coding required.
+      </p>
+
+      <div style={styles.converterSteps}>
+        {STEPS.map(s => (
+          <div key={s.id} style={{ ...styles.converterStep, ...(step === s.id ? styles.converterStepActive : {}) }}>
+            {s.label}
+          </div>
+        ))}
+      </div>
+
+      {step === 'upload' && (
+        <div style={styles.formGroup}>
+          <label style={styles.label}>Upload Lender Rate Sheet (PDF, Excel, or CSV)</label>
+          <input type="file" accept=".csv,.xlsx,.xls,.pdf" onChange={handleFile} style={styles.fileInput} />
+          {fileError && (
+            <div style={styles.errorBox}>
+              <span>⚠️</span> {fileError}
+            </div>
+          )}
+        </div>
+      )}
+
+      {step === 'map' && table && (
+        <div>
+          <h3 style={styles.sectionTitle}>Detected Columns</h3>
+          <div>{table.header.map((h, i) => <span key={i} style={styles.prequalChip}>{h}</span>)}</div>
+
+          <h3 style={{ ...styles.sectionTitle, marginTop: '20px' }}>Preview (first 5 rows)</h3>
+          <div style={{ overflowX: 'auto' }}>
+            <table style={styles.auditTable}>
+              <thead>
+                <tr>{table.header.map((h, i) => <th key={i} style={styles.converterTh}>{h}</th>)}</tr>
+              </thead>
+              <tbody>
+                {table.rows.slice(0, 5).map((r, ri) => (
+                  <tr key={ri}>{table.header.map((_, ci) => <td key={ci} style={styles.converterTd}>{r[ci]}</td>)}</tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+
+          <h3 style={{ ...styles.sectionTitle, marginTop: '20px' }}>Lender Preset</h3>
+          <select style={styles.select} value={presetKey} onChange={e => applyPreset(e.target.value)}>
+            <option value="">Manual (no preset)</option>
+            {Object.entries(LENDER_PRESETS).map(([key, p]) => <option key={key} value={key}>{p.label}</option>)}
+          </select>
+          <p style={styles.feeNote}>
+            A preset auto-fills likely column mappings below — always double-check them before continuing.
+          </p>
+
+          {rateLikeColumns.length > 1 && (
+            <div style={styles.converterCollapsible}>
+              <button type="button" onClick={() => setShowAllRateColumns(v => !v)} style={styles.converterCollapsibleToggle}>
+                {showAllRateColumns ? '▾' : '▸'} This file has {rateLikeColumns.length} rate-like columns
+              </button>
+              {showAllRateColumns && (
+                <div style={styles.feeNote}>
+                  {rateLikeColumns.join(', ')} — pick whichever one you want to use (e.g. "30-Day Rate") in the
+                  Base Rate mapping below.
+                </div>
+              )}
+            </div>
+          )}
+
+          <h3 style={{ ...styles.sectionTitle, marginTop: '20px' }}>Column Mapping</h3>
+
+          <div style={styles.converterMappingRow}>
+            <label style={styles.radioLabel}>
+              <input type="checkbox" checked={singleLtvRangeMode} onChange={e => setSingleLtvRangeMode(e.target.checked)} />
+              This file has a single combined LTV range column (e.g. "60.01-65") instead of separate start/end columns
+            </label>
+          </div>
+
+          {singleLtvRangeMode ? (
+            <div style={styles.converterMappingRow}>
+              <div style={styles.converterMappingLabel}>
+                LTV Range <span style={{ color: '#c33' }}>*</span>
+                <div style={styles.feeNote}>Will be split into ltv_start / ltv_end automatically.</div>
+              </div>
+              <select style={styles.select} value={ltvRangeColumn} onChange={e => setLtvRangeColumn(e.target.value)}>
+                <option value="">— Select column —</option>
+                {table.header.map(h => <option key={h} value={h}>{h}</option>)}
+              </select>
+            </div>
+          ) : null}
+
+          {STANDARD_RATE_COLUMNS.filter(col => !(singleLtvRangeMode && (col.key === 'ltv_start' || col.key === 'ltv_end'))).map(col => {
+            const m = mapping[col.key];
+            return (
+              <div key={col.key} style={styles.converterMappingRow}>
+                <div style={styles.converterMappingLabel}>
+                  {col.label} {col.required && <span style={{ color: '#c33' }}>*</span>}
+                  <div style={styles.feeNote}>{col.help}</div>
+                </div>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '6px', flex: 1 }}>
+                  {col.canBeFixed && (
+                    <div style={{ display: 'flex', gap: '14px', fontSize: '13px' }}>
+                      <label style={styles.radioLabel}>
+                        <input type="radio" checked={m.mode !== 'fixed'} onChange={() => setMappingMode(col.key, 'column')} />
+                        Map to a column
+                      </label>
+                      <label style={styles.radioLabel}>
+                        <input type="radio" checked={m.mode === 'fixed'} onChange={() => setMappingMode(col.key, 'fixed')} />
+                        Same value for every row
+                      </label>
+                    </div>
+                  )}
+                  {m.mode === 'fixed' ? (
+                    <input
+                      type="text"
+                      style={styles.input}
+                      value={m.fixedValue}
+                      placeholder={`e.g. "${col.key === 'lender' ? 'NMSI' : 'Value'}"`}
+                      onChange={e => setFixedMapping(col.key, e.target.value)}
+                    />
+                  ) : (
+                    <select style={styles.select} value={m.column} onChange={e => setColumnMapping(col.key, e.target.value)}>
+                      <option value="">— Not mapped —</option>
+                      {table.header.map(h => <option key={h} value={h}>{h}</option>)}
+                    </select>
+                  )}
+                </div>
+              </div>
+            );
+          })}
+
+          {mappingError && (
+            <div style={styles.errorBox}>
+              <span>⚠️</span> {mappingError}
+            </div>
+          )}
+
+          <div style={{ display: 'flex', gap: '10px', marginTop: '16px' }}>
+            <button onClick={goToPreview} style={styles.submitButton}>Continue to Preview</button>
+            <button onClick={resetAll} style={styles.secondaryButton}>Try Again</button>
+          </div>
+        </div>
+      )}
+
+      {step === 'preview' && table && (
+        <div>
+          <h3 style={styles.sectionTitle}>Converted Preview (first 10 rows)</h3>
+          <div style={{ overflowX: 'auto' }}>
+            <table style={styles.auditTable}>
+              <thead>
+                <tr>
+                  {[...REQUIRED_RATE_SHEET_COLUMNS, ...['state', 'occupancy', 'qualification_method', 'effective_date'].filter(k => validRows.some(r => r[k] !== undefined))]
+                    .map(c => <th key={c} style={styles.converterTh}>{c}</th>)}
+                </tr>
+              </thead>
+              <tbody>
+                {validRows.slice(0, 10).map((row, ri) => (
+                  <tr key={ri}>
+                    {[...REQUIRED_RATE_SHEET_COLUMNS, ...['state', 'occupancy', 'qualification_method', 'effective_date'].filter(k => validRows.some(r => r[k] !== undefined))]
+                      .map(c => <td key={c} style={styles.converterTd}>{row[c] ?? ''}</td>)}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+
+          <p style={styles.feeNote}>
+            {validRows.length} of {converted.length} row(s) converted successfully
+            {rowErrors.length > 0 ? `, ${rowErrors.length} skipped (see below).` : '.'}
+          </p>
+
+          {rowErrors.length > 0 && (
+            <div style={styles.errorBox}>
+              <div>
+                {rowErrors.slice(0, 10).map(e => (
+                  <div key={e.idx}>Could not convert row {e.idx + 2}: {e.error}</div>
+                ))}
+                {rowErrors.length > 10 && <div>...and {rowErrors.length - 10} more.</div>}
+              </div>
+            </div>
+          )}
+
+          <div style={{ display: 'flex', gap: '10px', marginTop: '16px' }}>
+            <button onClick={handleDownload} style={styles.submitButton} disabled={validRows.length === 0}>
+              ⬇️ Download Converted CSV
+            </button>
+            <button onClick={() => setStep('map')} style={styles.secondaryButton}>← Back to Mapping</button>
+            <button onClick={resetAll} style={styles.secondaryButton}>Try Again</button>
+          </div>
+        </div>
       )}
     </div>
   );
@@ -2747,6 +3360,67 @@ const styles = {
     width: '100%',
     borderCollapse: 'collapse',
     marginTop: '20px'
+  },
+  converterSteps: {
+    display: 'flex',
+    gap: '8px',
+    margin: '16px 0 24px'
+  },
+  converterStep: {
+    padding: '8px 16px',
+    borderRadius: '20px',
+    backgroundColor: '#f0f0f0',
+    color: '#999',
+    fontSize: '13px',
+    fontWeight: '600'
+  },
+  converterStepActive: {
+    backgroundColor: '#0066cc',
+    color: '#fff'
+  },
+  converterMappingRow: {
+    display: 'flex',
+    gap: '16px',
+    padding: '12px 0',
+    borderBottom: '1px solid #eee',
+    alignItems: 'flex-start'
+  },
+  converterMappingLabel: {
+    width: '220px',
+    flexShrink: 0,
+    fontWeight: '600',
+    fontSize: '14px',
+    color: '#333'
+  },
+  converterCollapsible: {
+    backgroundColor: '#f9f9f9',
+    border: '1px solid #eee',
+    borderRadius: '6px',
+    padding: '10px 14px',
+    margin: '12px 0'
+  },
+  converterCollapsibleToggle: {
+    background: 'none',
+    border: 'none',
+    cursor: 'pointer',
+    fontSize: '13px',
+    fontWeight: '600',
+    color: '#333',
+    padding: 0
+  },
+  converterTh: {
+    textAlign: 'left',
+    padding: '8px 12px',
+    borderBottom: '2px solid #ddd',
+    fontSize: '12px',
+    color: '#666',
+    whiteSpace: 'nowrap'
+  },
+  converterTd: {
+    padding: '8px 12px',
+    borderBottom: '1px solid #eee',
+    fontSize: '13px',
+    whiteSpace: 'nowrap'
   }
 };
 
