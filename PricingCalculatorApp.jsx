@@ -1336,6 +1336,151 @@ function parseRateSheetCsv(text) {
   return { rows };
 }
 
+// Shared by the Excel and PDF paths (CSV keeps its own inline logic above,
+// untouched, so existing CSV behavior can't regress).
+function validateTableRows(header, dataRows) {
+  const cleanHeader = header.map(h => String(h ?? '').trim().toLowerCase());
+  const missing = REQUIRED_RATE_SHEET_COLUMNS.filter(col => !cleanHeader.includes(col));
+  if (missing.length > 0) {
+    return {
+      error: `Could not find required columns. Expected: ${REQUIRED_RATE_SHEET_COLUMNS.join(', ')}. Detected: ${cleanHeader.length ? cleanHeader.join(', ') : '(none)'}`
+    };
+  }
+
+  const rows = [];
+  for (let i = 0; i < dataRows.length; i++) {
+    const raw = dataRows[i] || [];
+    const isBlank = raw.every(v => v === undefined || v === null || String(v).trim() === '');
+    if (isBlank) continue;
+    const row = {};
+    cleanHeader.forEach((col, idx) => {
+      row[col] = raw[idx] !== undefined && raw[idx] !== null ? String(raw[idx]).trim() : '';
+    });
+    if ([row.ltv_start, row.ltv_end, row.base_rate].some(v => v === '' || isNaN(parseFloat(v)))) {
+      return { error: `Row ${i + 2} has a non-numeric ltv_start, ltv_end, or base_rate value.` };
+    }
+    rows.push(row);
+  }
+
+  if (rows.length === 0) {
+    return { error: 'No usable data rows were found after the header.' };
+  }
+  return { rows };
+}
+
+// Reads the first sheet that actually looks like a data table (a header row
+// plus at least one data row), not necessarily the very first sheet in the
+// workbook - some rate sheets ship with a notes/cover sheet first.
+async function parseExcelRateSheet(file) {
+  // Dynamically imported so its ~1MB doesn't load for every borrower on the
+  // public Pre-Qual/Calculator tabs - only when an admin actually uploads
+  // an Excel file here.
+  const XLSX = await import('xlsx');
+  let workbook;
+  try {
+    const buffer = await file.arrayBuffer();
+    workbook = XLSX.read(buffer, { type: 'array' });
+  } catch (err) {
+    return { error: `Could not read ${file.name}. Please ensure it's a valid Excel or PDF file with a data table.` };
+  }
+
+  let table = null;
+  for (const sheetName of workbook.SheetNames) {
+    const data = XLSX.utils.sheet_to_json(workbook.Sheets[sheetName], { header: 1, raw: false, blankrows: false });
+    if (data.length >= 2 && (data[0] || []).length >= 2) {
+      table = data;
+      break;
+    }
+  }
+  if (!table) {
+    return { error: `Could not read ${file.name}. Please ensure it's a valid Excel or PDF file with a data table.` };
+  }
+
+  return validateTableRows(table[0], table.slice(1));
+}
+
+// Best-effort table reconstruction from a PDF's text layer: groups text
+// fragments into rows by y-position, then splits each row into columns
+// wherever there's a wide horizontal gap between fragments. This works for
+// simple, cleanly-formatted single-table PDFs (e.g. a spreadsheet exported
+// to PDF); it is NOT a substitute for a real table-extraction engine and
+// will not reliably handle multi-column layouts, merged cells, or scanned
+// (image-only) PDFs with no text layer - those fall through to the
+// validation error below rather than silently producing wrong data.
+async function parsePdfRateSheet(file) {
+  // Dynamically imported for the same reason as XLSX above - pdfjs-dist plus
+  // its worker is over 2MB combined, and should only load for an admin
+  // actually uploading a PDF rate sheet, not every borrower on the site.
+  const [pdfjsLib, pdfjsWorkerUrlModule] = await Promise.all([
+    import('pdfjs-dist'),
+    import('pdfjs-dist/build/pdf.worker.min.mjs?url')
+  ]);
+  pdfjsLib.GlobalWorkerOptions.workerSrc = pdfjsWorkerUrlModule.default;
+
+  let pdf;
+  try {
+    const buffer = await file.arrayBuffer();
+    pdf = await pdfjsLib.getDocument({ data: buffer }).promise;
+  } catch (err) {
+    return { error: `Could not read ${file.name}. Please ensure it's a valid Excel or PDF file with a data table.` };
+  }
+
+  const items = [];
+  for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {
+    const page = await pdf.getPage(pageNum);
+    const content = await page.getTextContent();
+    content.items.forEach(item => {
+      if (!item.str || !item.str.trim()) return;
+      items.push({ text: item.str.trim(), x: item.transform[4], y: item.transform[5], page: pageNum, width: item.width || 0 });
+    });
+  }
+  if (!items.length) {
+    return { error: `Could not read ${file.name}. Please ensure it's a valid Excel or PDF file with a data table.` };
+  }
+
+  const rowMap = new Map();
+  items.forEach(it => {
+    const key = `${it.page}:${Math.round(it.y)}`;
+    if (!rowMap.has(key)) rowMap.set(key, []);
+    rowMap.get(key).push(it);
+  });
+
+  const rowsRaw = [...rowMap.keys()]
+    .map(key => {
+      const [p, y] = key.split(':').map(Number);
+      return { page: p, y, items: rowMap.get(key) };
+    })
+    .sort((a, b) => a.page - b.page || b.y - a.y)
+    .map(r => r.items.sort((a, b) => a.x - b.x));
+
+  const COLUMN_GAP_THRESHOLD = 8; // points of empty space that implies a new column
+  const tableRows = rowsRaw
+    .map(rowItems => {
+      const cols = [];
+      let current = rowItems[0].text;
+      let currentEnd = rowItems[0].x + rowItems[0].width;
+      for (let i = 1; i < rowItems.length; i++) {
+        const gap = rowItems[i].x - currentEnd;
+        if (gap > COLUMN_GAP_THRESHOLD) {
+          cols.push(current);
+          current = rowItems[i].text;
+        } else {
+          current += ' ' + rowItems[i].text;
+        }
+        currentEnd = rowItems[i].x + rowItems[i].width;
+      }
+      cols.push(current);
+      return cols;
+    })
+    .filter(cols => cols.length > 1); // drop stray single-column lines (titles, page numbers, footers)
+
+  if (tableRows.length < 2) {
+    return { error: `Could not read ${file.name}. Please ensure it's a valid Excel or PDF file with a data table.` };
+  }
+
+  return validateTableRows(tableRows[0], tableRows.slice(1));
+}
+
 const AdminRatesTab = () => {
   const [sheets, setSheets] = useState(loadRateSheets);
   const [uploadError, setUploadError] = useState('');
@@ -1345,31 +1490,42 @@ const AdminRatesTab = () => {
     localStorage.setItem(RATE_SHEETS_STORAGE_KEY, JSON.stringify(next));
   };
 
+  const finishUpload = (file, result) => {
+    if (result.error) {
+      setUploadError(`${file.name}: ${result.error}`);
+      return;
+    }
+    const sheet = {
+      id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      filename: file.name,
+      lenders: [...new Set(result.rows.map(r => r.lender))],
+      products: [...new Set(result.rows.map(r => r.product))],
+      rowCount: result.rows.length,
+      rows: result.rows,
+      uploadedDate: new Date().toLocaleString('en-US')
+    };
+    persist([sheet, ...sheets]);
+  };
+
   const handleFileChange = (e) => {
     const file = e.target.files?.[0];
     if (!file) return;
     setUploadError('');
+    const name = file.name.toLowerCase();
 
-    const reader = new FileReader();
-    reader.onload = (event) => {
-      const result = parseRateSheetCsv(String(event.target.result));
-      if (result.error) {
-        setUploadError(`${file.name}: ${result.error}`);
-        return;
-      }
-      const sheet = {
-        id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-        filename: file.name,
-        lenders: [...new Set(result.rows.map(r => r.lender))],
-        products: [...new Set(result.rows.map(r => r.product))],
-        rowCount: result.rows.length,
-        rows: result.rows,
-        uploadedDate: new Date().toLocaleString('en-US')
-      };
-      persist([sheet, ...sheets]);
-    };
-    reader.onerror = () => setUploadError(`${file.name}: Could not read file.`);
-    reader.readAsText(file);
+    if (name.endsWith('.csv')) {
+      // Unchanged from before - CSV upload behaves exactly as it always has.
+      const reader = new FileReader();
+      reader.onload = (event) => finishUpload(file, parseRateSheetCsv(String(event.target.result)));
+      reader.onerror = () => setUploadError(`${file.name}: Could not read file.`);
+      reader.readAsText(file);
+    } else if (name.endsWith('.xlsx') || name.endsWith('.xls')) {
+      parseExcelRateSheet(file).then(result => finishUpload(file, result));
+    } else if (name.endsWith('.pdf')) {
+      parsePdfRateSheet(file).then(result => finishUpload(file, result));
+    } else {
+      setUploadError(`${file.name}: Unsupported file type. Please upload a .csv, .xlsx, .xls, or .pdf file.`);
+    }
     e.target.value = '';
   };
 
@@ -1382,9 +1538,14 @@ const AdminRatesTab = () => {
       <h2>Rate Sheets</h2>
 
       <div style={styles.formGroup}>
-        <label style={styles.label}>Upload Rate Sheet (CSV)</label>
-        <input type="file" accept=".csv" onChange={handleFileChange} style={styles.fileInput} />
+        <label style={styles.label}>Upload Rate Sheet (CSV, Excel, or PDF)</label>
+        <input type="file" accept=".csv,.xlsx,.xls,.pdf" onChange={handleFileChange} style={styles.fileInput} />
         <p style={styles.feeNote}>Required columns: {REQUIRED_RATE_SHEET_COLUMNS.join(', ')}</p>
+        <p style={styles.feeNote}>
+          Excel and PDF uploads are parsed automatically — for PDFs, this works best with a simple, single table
+          exported directly from a spreadsheet. Complex layouts or scanned/image PDFs may not parse; use CSV or
+          Excel for those.
+        </p>
       </div>
 
       {uploadError && (

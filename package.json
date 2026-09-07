@@ -11,8 +11,10 @@
   },
   "dependencies": {
     "html2pdf.js": "^0.14.0",
+    "pdfjs-dist": "^6.3.289",
     "react": "^18.2.0",
-    "react-dom": "^18.2.0"
+    "react-dom": "^18.2.0",
+    "xlsx": "https://cdn.sheetjs.com/xlsx-latest/xlsx-latest.tgz"
   },
   "devDependencies": {
     "@vitejs/plugin-react": "^4.2.0",
